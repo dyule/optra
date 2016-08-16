@@ -2,6 +2,13 @@
 name = "optra"
 version = "0.1.0"
 authors = ["Daniel Yule <daniel.yule@gmail.com>"]
+description = "An engine for remote file synchronization"
+documentation = "https://dyule.github.io/optra/optra/"
+homepage = "https://github.com/dyule/optra"
+repository = "https://github.com/dyule/optra"
+readme = "README.md"
+keywords = ["ABST", "operational transformation", "OT", "file synchronization", "remote files"]
+license = "MIT"
 
 [dependencies]
 serde = "*"
