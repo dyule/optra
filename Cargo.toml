@@ -7,13 +7,13 @@ documentation = "https://dyule.github.io/optra/optra/"
 homepage = "https://github.com/dyule/optra"
 repository = "https://github.com/dyule/optra"
 readme = "README.md"
-keywords = ["ABST", "operational transformation", "OT", "file synchronization", "remote files"]
+keywords = ["ABST", "OT", "file-synchronization", "synchronization", "remote-files"]
 license = "MIT"
 
 [dependencies]
-serde = "*"
-serde_json = "*"
-serde_macros = "*"
+serde = "^0.8"
+serde_json = "^0.8"
+serde_macros = "^0.8"
 log = "0.3"
 rdiff = "^0.1.1"
 
