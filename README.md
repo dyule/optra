@@ -7,6 +7,8 @@ Optra currently requires nightly rust to build, because it uses in place inserti
 
 Optra is licensed using the MIT license (see [LICENSE](LICENSE))
 
+[Documentation](https://dyule.github.io/optra/optra/)
+
 # Usage
  The engine is based on the Admissabilty Based Sequence Transformation algorithm (doi: [10.1109/TPDS.2010.64](http://dx.doi.org.ezproxy.library.dal.ca/10.1109/TPDS.2010.64))
  The idea is that each site that wants to have a file synchronized will have an instance of [`Engine`](engine/struct.Engine.html) running.
