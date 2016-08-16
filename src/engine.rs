@@ -1,11 +1,23 @@
 use std::collections::LinkedList;
 use std::cmp::Ordering;
-use std::result::Result as StdResult;
-use operations::{State, Operation, InsertOperation, DeleteOperation};
-use ::{OTError, ErrorKind as Kind, Position};
+use std::fs::{File};
+use std::path::Path;
+use std::io::{self, Read, Write};
+use operations::{State, Operation, InsertOperation, DeleteOperation, Advance, OperationInternal};
+use ::{OTError, ErrorKind as Kind, Offset, Position};
+use utils::{SequenceTransformer, SequenceSwapper};
+use std::mem;
+use rdiff::Diff;
 
-pub type Result<T> = StdResult<T, OTError>;
-
+/// Process file change operations in such a way that they can be synchronized across sites
+///
+/// The engine keeps track of all transactions that have occurred so far, and makes sure that any operations that
+/// happen locally or remotely will result in a consistent file on every site.
+///
+/// To use, simply pass through any local edits via `process_diffs()` (if they are recorded in a [`Diff`](https://dyule.github.io/rdiff/rdiff/struct.Diff.html))
+/// or `process_transaction()` (If the operations are already stored in a [`TransactionSequence`](struct.TransactionSequence.html)) and pass any remote edits received into `integrate_remote()`.
+///
+/// See the module level documentation for an example.
 pub struct Engine {
     /// The unique ID for this site
     site_id: u32,
@@ -24,9 +36,18 @@ pub struct Engine {
     time_stamp: u32
 }
 
+/// Represents a sequence of transactions that can be performed on a file.
+///
+/// The operations are stored in the order they occur in the file, and each operation
+/// assumes the previous operations have taken place.  Furthermore, the insertion operations are
+/// assumed to take place prior to the deletion operations.
+#[derive(Debug)]
 pub struct TransactionSequence {
     /// The state that this sequence started with
-    starting_state: State,
+    starting_state: Option<State>,
+
+    /// The site that this sequence originated from
+    original_site: u32,
 
     /// The inserts for this sequence, stored in effect order
     inserts: LinkedList<InsertOperation>,
@@ -50,13 +71,46 @@ impl Engine {
         }
     }
 
+    /// Convert the diffs we got from analyzing a file into a TransactionSequence
+    /// we can send to another site for synchronization.
+    pub fn process_diffs(&mut self, diff: Diff) -> TransactionSequence {
+        let last_state = self.last_state.clone();
+        let inserts = diff.inserts().map(|insert| {
+            let i = InsertOperation::new(
+                insert.get_position()as Position,
+                insert.get_data().clone(),
+                State::new(self.site_id, self.time_stamp, self.time_stamp)
+            );
+            self.time_stamp += 1;
+            i
+        }).collect();
+
+
+        let deletes = diff.deletes().map(|delete| {
+            let d = DeleteOperation::new(
+                delete.get_position() as Position,
+                delete.get_length() as Position,
+                State::new(self.site_id, self.time_stamp, self.time_stamp)
+            );
+            self.time_stamp += 1;
+            d
+        }).collect();
+
+        let mut sequence = TransactionSequence::new(last_state, self.site_id, inserts, deletes);
+        self.process_transaction(&mut sequence);
+        if self.time_stamp > 0 {
+            self.last_state = Some(State::new(self.site_id, self.time_stamp - 1, self.time_stamp -1 ));
+        }
+        sequence
+    }
+
     /// Integrates the sequence of operations given by `remote_sequence` into the local history.  The ordering
     /// properties of the local history will be maintained, and a sequence of operations that
     /// can be applied to the local state will be returned.
-    pub fn integrate_remote(&mut self, remote_sequence: &mut TransactionSequence) -> StdResult<(), OTError> {
+    pub fn integrate_remote(&mut self, remote_sequence: &mut TransactionSequence) -> Result<(), OTError> {
 
         //Get all the local inserts that have happened since the last sync with the remote site
-        let local_concurrent_inserts = try!(self.get_concurrent_inserts(&remote_sequence.starting_state));
+        let local_concurrent_inserts = try!(self.get_concurrent_inserts(&remote_sequence.starting_state, remote_sequence.original_site));
         // Transform the remote inserts so that they account for the changes from the local inserts
         Engine::transform(&mut remote_sequence.inserts, &local_concurrent_inserts);
 
@@ -75,12 +129,15 @@ impl Engine {
 
         // Adjust the local deletes with the remote inserts that have been merged into the local inserts
         Engine::transform(&mut self.deletes, &transformed_remote_inserts);
-
         // Transform the remote deletes with all of the local inserts that happened since the last sync
-        Engine::transform(&mut remote_sequence.deletes, &local_concurrent_inserts);
+        let transformed_concurrent_inserts = try!(self.get_concurrent_inserts(&remote_sequence.starting_state, remote_sequence.original_site));
+
+        Engine::transform(&mut remote_sequence.deletes, &transformed_concurrent_inserts);
+        trace!("Sequence: {:?}", remote_sequence);
 
         // Transform the remote deletes with ALL of the local deletes.
         Engine::transform(&mut remote_sequence.deletes, &self.deletes);
+        trace!("Sequence: {:?}", remote_sequence);
 
         self.assign_timestamps(&mut remote_sequence.deletes);
 
@@ -90,124 +147,183 @@ impl Engine {
          Ok(())
 
     }
+
+    /// Processes a series of operations prior to being sent out to remote sites.  The operations must
+    /// have been performed on the data after every operation in the local history, but no others.  The
+    /// operations in the transaction must also be effect order, with the inserts preceding the deletes.
+    pub fn process_transaction(&mut self, outgoing_sequence: &mut TransactionSequence) {
+
+    // Swap the execution order of the outgoing insert operations so that they happen before the local deletes
+    Engine::swap(&mut outgoing_sequence.inserts, &mut self.deletes);
+
+    let original_deletes = outgoing_sequence.deletes.clone();
+    // Swap the execution order of the outgoing delete operations so they happen before the local deletes
+    Engine::swap(&mut outgoing_sequence.deletes, &mut self.deletes.clone());
+
+    // Record that we've performed the outgoing insertion operations
+    Engine::merge_sequences(&mut self.inserts, &outgoing_sequence.inserts);
+
+    // Record that we've performed the outgoing delete operations
+    Engine::merge_sequences(&mut self.deletes, &original_deletes);
+
+    }
 }
 
 // Private methods
 impl Engine {
-    fn get_concurrent_inserts(&self, starting_state: &State) -> Result<LinkedList<InsertOperation>> {
-
-        let reference_time = match self.inserts.iter().find(|o| o.get_state().matches(starting_state)) {
-            Some(ref o) => o.get_state().get_time(),
-            None => {
-                match self.deletes.iter().find(|o| o.get_state().matches(starting_state)) {
-                    Some(ref o) => o.get_state().get_time(),
-                    None => return Err(OTError::new(Kind::NoSuchState))
+    fn get_concurrent_inserts(&self, starting_state: &Option<State>, original_site: u32) -> Result<LinkedList<InsertOperation>, OTError> {
+        if let &Some(ref starting_state) = starting_state {
+            let reference_time = match self.inserts.iter().find(|o| o.get_state().matches(starting_state)) {
+                Some(ref o) => o.get_state().get_time(),
+                None => {
+                    match self.deletes.iter().find(|o| o.get_state().matches(starting_state)) {
+                        Some(ref o) => o.get_state().get_time(),
+                        None => return Err(OTError::new(Kind::NoSuchState))
+                    }
                 }
-            }
-        };
+            };
 
-        Ok(self.inserts.iter().filter(|o| o.get_state().happened_after(reference_time)).map(|o| o.clone()).collect())
+            Ok(self.inserts.iter().filter(|o| o.get_state().happened_after(reference_time, original_site)).map(|o| o.clone()).collect())
+        } else {
+            Ok(self.inserts.clone())
+        }
 
     }
 
     fn assign_timestamps<O: Operation>(&mut self, sequence: &mut LinkedList<O>) {
         for o in sequence {
-            self.time_stamp += 1;
             o.get_state_mut().set_time(self.time_stamp);
+            self.time_stamp += 1;
+        }
+        if self.time_stamp > 0 {
+            self.last_state = Some(State::new(self.site_id, self.time_stamp - 1, self.time_stamp -1 ));
         }
     }
 
-    fn transform<O1: Operation, O2: Operation>(incoming_sequence: &mut LinkedList<O1>, existing_sequence: &LinkedList<O2>)  {
-        // let mut incoming_offset = 0;
-        // let mut existing_offset = 0;
-        // let mut incoming_iter = incoming_sequence.iter_mut();
-        // let mut existing_iter = existing_sequence.iter();
-        // let mut incoming_op = incoming_iter.next();
-        // let mut existing_op = existing_iter.next();
-        // let mut size_delta = 0;
-        // let mut position_delta = 0;
-        // println!("Loop Starting");
-        // loop {
-        //     let advance_incoming = if let Some(existing_op) = existing_op {
-        //          if let Some(ref mut incoming_op) = incoming_op {
-        //              println!("Before update: Incoming: ({:2}, {:2}) : {:2}, Existing: ({:2}, {:2}) : {:2} - {:2}", incoming_op.get_position(), -incoming_op.get_increment(), incoming_offset,  existing_op.get_position(), -existing_op.get_increment(), existing_offset, size_delta);
-        //              let (size_change, position_change) = incoming_op.resolve_overlap(existing_op, incoming_offset - size_delta, existing_offset);
-        //              size_delta += size_change;
-        //              position_delta += position_change;
-        //             if incoming_op.compare_with_offsets(existing_op, incoming_offset, existing_offset) {
-        //                 incoming_op.update_position_by(existing_offset + size_delta - size_change + position_delta);
-        //                 //incoming_offset -= change;
-        //                 position_delta = 0;
-        //                 println!(">After update: *Incoming: ({:2}, {:2}) : {:2}, Existing: ({:2}, {:2}) : {:2} - {:2}", incoming_op.get_position(), -incoming_op.get_increment(), incoming_offset,  existing_op.get_position(), -existing_op.get_increment(), existing_offset, size_delta);
-        //                 true
-        //             } else {
-        //                 println!(">After update: Incoming: ({:2}, {:2}) : {:2}, *Existing: ({:2}, {:2}) : {:2} - {:2}", incoming_op.get_position(), -incoming_op.get_increment(), incoming_offset,  existing_op.get_position(), -existing_op.get_increment(), existing_offset, size_delta);
-        //                 false
-        //             }
-        //         } else {
-        //             false
-        //         }
-        //     } else{
-        //         if let Some(ref mut incoming_op) = incoming_op {
-        //             incoming_op.update_position_by(existing_offset + size_delta + position_delta);
-        //             position_delta = 0;
-        //             true
-        //         } else {
-        //             break;
-        //         }
-        //     };
-        //     if advance_incoming {
-        //         incoming_offset += incoming_op.unwrap().get_increment();
-        //         incoming_op = incoming_iter.next();
-        //     } else {
-        //         existing_offset += existing_op.unwrap().get_increment();
-        //         existing_op = existing_iter.next();
-        //     }
-        //
-        //
-        // }
-        // while let Some(existing_op) = existing_iter.next() {
-        //     loop {
-        //         if let Some(ref mut incoming_op) = incoming_op {
-        //             trace!("Existing: {:?}, Offset: {:?}. Incoming: {:?}, Offset: {:?}", existing_op, existing_offset, incoming_op, incoming_offset);
-        //             if !incoming_op.compare_with_offsets(existing_op, incoming_offset, existing_offset) {
-        //                 let change = incoming_op.resolve_overlap(existing_op, incoming_offset, existing_offset);
-        //                 incoming_offset += change;
-        //                 delta += change;
-        //                 debug!("Change before break: {}", change);
-        //                 break
-        //             }
-        //             let change = incoming_op.resolve_overlap(existing_op, incoming_offset, existing_offset);
-        //             incoming_op.update_position_by(existing_offset + delta);
-        //             incoming_offset += change;
-        //             delta += change;
-        //             debug!("Change during loop: {}", change);
-        //             incoming_offset += incoming_op.get_increment();
-        //         } else {
-        //             break
-        //         }
-        //         trace!("Next incoming operation");
-        //         incoming_op = incoming_iter.next()
-        //     }
-        //     existing_offset += existing_op.get_increment();
-        //     trace!("Next existing operation");
-        // }
-        // loop {
-        //     if let Some(ref mut incoming_op) = incoming_op {
-        //         incoming_op.update_position_by(existing_offset + delta);
-        //     } else {
-        //         break;
-        //     }
-        //     incoming_op = incoming_iter.next()
-        // }
+    fn transform<O1: OperationInternal, O2: OperationInternal>(incoming_sequence: &mut LinkedList<O1>, existing_sequence: &LinkedList<O2>)  {
+        let mut incoming_iter = incoming_sequence.iter_mut();
+        let mut existing_iter = existing_sequence.iter();
+        let mut saved_op = None;
+        let mut incoming_op = incoming_iter.next();
+        let mut existing_op = existing_iter.next();
+        let mut transformer = SequenceTransformer::new();
+        println!("Loop Starting");
+        loop {
+
+            let advance_action = if let Some(existing_op) = existing_op {
+                 if let Some(ref mut incoming_op) = incoming_op {
+                     transformer.transform_operations::<O1, O2>(incoming_op, existing_op)
+                } else {
+                    if let Some(ref mut incoming_op) = saved_op{
+                        transformer.transform_operations::<O1, O2>(incoming_op, existing_op)
+                    } else {
+                        Advance::Existing
+                    }
+                }
+            } else{
+                if let Some(ref mut incoming_op) = incoming_op {
+                    transformer.transform_single::<O1>(incoming_op);
+                    Advance::Incoming
+                } else if let Some(ref mut incoming_op) = saved_op{
+                    transformer.transform_single::<O1>(incoming_op);
+                    Advance::Incoming
+                } else {
+                    break;
+                }
+            };
+            match advance_action {
+                Advance::Incoming => {
+                    if saved_op.is_some() {
+                        incoming_iter.insert_next(mem::replace(&mut saved_op, None).unwrap())
+                    }
+                    incoming_op = incoming_iter.next();
+                },
+                Advance::Existing => {
+                    existing_op = existing_iter.next();
+                },
+                Advance::Neither(new_op) => {
+                    if saved_op.is_some() {
+                        incoming_iter.insert_next(mem::replace(&mut saved_op, Some(new_op)).unwrap())
+                    } else {
+                        mem::replace(&mut saved_op, Some(new_op));
+                    }
+                    incoming_op = None;
+                }
+            }
+
+
+        }
+    }
+
+    fn swap<O: OperationInternal>(incoming_sequence: &mut LinkedList<O>, existing_sequence: &mut LinkedList<DeleteOperation>)  {
+        let mut incoming_iter = incoming_sequence.iter_mut();
+        let mut existing_iter = existing_sequence.iter_mut();
+        let mut saved_op = None;
+        let mut incoming_op = incoming_iter.next();
+        let mut existing_op = existing_iter.next();
+        let mut swapper = SequenceSwapper::new();
+        println!("Loop Starting");
+        loop {
+
+            let advance_action = if let Some(ref mut existing_op) = existing_op {
+                 if let Some(ref mut incoming_op) = incoming_op {
+                     swapper.swap_operations::<O>(incoming_op, existing_op)
+                } else {
+                    if let Some(ref mut incoming_op) = saved_op{
+                        swapper.swap_operations::<O>(incoming_op, existing_op)
+                    } else {
+                        swapper.swap_existing(existing_op);
+                        Advance::Existing
+                    }
+                }
+            } else{
+                if let Some(ref mut incoming_op) = incoming_op {
+                    swapper.swap_single::<O>(incoming_op);
+                    Advance::Incoming
+                } else if let Some(ref mut incoming_op) = saved_op{
+                    swapper.swap_single::<O>(incoming_op);
+                    Advance::Incoming
+                } else {
+                    break;
+                }
+            };
+            match advance_action {
+                Advance::Incoming => {
+                    if saved_op.is_some() {
+                        incoming_iter.insert_next(mem::replace(&mut saved_op, None).unwrap())
+                    }
+                    incoming_op = incoming_iter.next();
+                },
+                Advance::Existing => {
+                    existing_op = existing_iter.next();
+                },
+                Advance::Neither(new_op) => {
+                    if saved_op.is_some() {
+                        incoming_iter.insert_next(mem::replace(&mut saved_op, Some(new_op)).unwrap())
+                    } else {
+                        mem::replace(&mut saved_op, Some(new_op));
+                    }
+                    incoming_op = None;
+                }
+            }
+
+
+        }
     }
 
 
-    fn merge_sequences<A: Ord + Clone>(seq1: &mut LinkedList<A>, seq2: &LinkedList<A>) {
-        fn something_less<A: Ord + Clone>(a: Option<&mut A>, b: &A) -> bool {
+
+    fn merge_sequences<O: OperationInternal>(seq1: &mut LinkedList<O>, seq2: &LinkedList<O>) {
+        fn something_less<O: OperationInternal>(mut a: Option<&mut O>, b: &O, offset: Offset) -> bool {
             match a {
-                Some(ref a) => {
-                    (**a).cmp(&b) == Ordering::Less
+                Some(ref mut a) => {
+                    if (**a).cmp(&b) == Ordering::Less {
+                        (**a).update_position_by(offset);
+                        true
+                    } else {
+                        false
+                    }
+
                 }, None => {
                     false
                 }
@@ -215,21 +331,80 @@ impl Engine {
         }
         let mut seq1_iter = seq1.iter_mut();
         let mut seq2_iter = seq2.iter();
+        let mut offset = 0;
         while let Some(elem2) = seq2_iter.next() {
-            while something_less(seq1_iter.peek_next(), &elem2) {
+            while something_less(seq1_iter.peek_next(), &elem2, offset) {
                 seq1_iter.next();
             }
+            offset += elem2.get_increment();
             seq1_iter.insert_next(elem2.clone());
+        }
+        while seq1_iter.peek_next().is_some() {
+            seq1_iter.next().unwrap().update_position_by(offset);
         }
     }
 
+
 }
 
+impl TransactionSequence {
+
+    /// Construct a new `TransactionSequence` from the given operations and metadata
+    /// The `starting_state` is the state of the file (as represented by a time_stamp) at the time the sequence was created, or `None` if the file was newly created.
+    /// The site is the location this `TransactionSequence` came from.
+    #[inline]
+    pub fn new(starting_state: Option<State>, site: u32, inserts: LinkedList<InsertOperation>, deletes: LinkedList<DeleteOperation>) -> TransactionSequence {
+        TransactionSequence {
+            starting_state: starting_state,
+            inserts: inserts,
+            deletes: deletes,
+            original_site: site
+        }
+    }
+
+
+    /// Apply the operations in this sequence to a file.  This should not be called until after
+    /// the sequence has been integrated via [`Engine::integrate_remote`](struct.Engine.html#method.integrate_remote)
+    pub fn apply<P: AsRef<Path> + Clone>(&self, path: P) -> io::Result<()> {
+        let read_file = try!(File::open(path.clone()));
+        let mut old_bytes = read_file.bytes();
+        let mut new_bytes = Vec::new();
+        let mut index = 0;
+        for insert in self.inserts.iter() {
+            while index < insert.get_position() {
+                new_bytes.push(try!(old_bytes.next().unwrap()).clone());
+                index += 1;
+            }
+            new_bytes.extend_from_slice(insert.get_value());
+            index += insert.get_value().len() as Position;
+        }
+        while let Some(byte) = old_bytes.next() {
+            new_bytes.push(try!(byte));
+        }
+        let old_bytes = mem::replace(&mut new_bytes, Vec::new());
+        let mut old_bytes = old_bytes.into_iter();
+        index = 0;
+        for delete in self.deletes.iter() {
+            while index < delete.get_position() {
+                new_bytes.push(old_bytes.next().unwrap());
+                index += 1;
+            }
+            for _ in 0..delete.get_length() {
+                old_bytes.next();
+            }
+        }
+        while let Some(byte) = old_bytes.next() {
+            new_bytes.push(byte);
+        }
+        let mut write_file = try!(File::create(path));
+        write_file.write_all(new_bytes.as_slice())
+    }
+}
 
 
 #[cfg(test)]
 mod tests {
-    use super::{Engine};
+    use super::{Engine, TransactionSequence};
     use std::collections::LinkedList;
     use operations::{InsertOperation, DeleteOperation, State, Operation};
     use ::{Position};
@@ -276,249 +451,598 @@ mod tests {
         }).collect()
     }
 
+
     #[test]
-    fn merging_sequences() {
-        let mut list1:LinkedList<_> = create_list![2, 5, 8, 12, 34, 89];
-        let list2:LinkedList<_> = create_list![5, 7, 9, 11, 45, 67];
-
-        Engine::merge_sequences(&mut list1, &list2);
-        assert_eq!(list1, create_list![2, 5, 5, 7, 8, 9, 11, 12, 34, 45, 67, 89]);
-        assert_eq!(list2, create_list![5, 7, 9, 11, 45, 67]);
-
-        Engine::merge_sequences(&mut list1, &LinkedList::new());
-        assert_eq!(list1, create_list![2, 5, 5, 7, 8, 9, 11, 12, 34, 45, 67, 89]);
-
-        let mut empty_list = LinkedList::new();
-        Engine::merge_sequences(&mut empty_list, &mut list1);
-        assert_eq!(list1, create_list![2, 5, 5, 7, 8, 9, 11, 12, 34, 45, 67, 89]);
-        assert_eq!(empty_list, create_list![2, 5, 5, 7, 8, 9, 11, 12, 34, 45, 67, 89]);
-
+    fn test_transform_insert_insert() {
+        // Starting with the buffer "The quick brown fox"
+        let mut sequence1 = generate_insert_list(vec![
+            // Add an "ee" after "the"
+            (3, "ee"),
+            // Add another "k" on the end of "quick"
+            (11, "k"),
+            // Add "wnwnwn" to the end of "brown"
+            (18, "wnwnwn"),
+            // Add "xx!" to the end of "fox"
+            (28, "xx!")
+        ], 2);
+        // After sequence1 is applied, we would have "Theee quickk brownwnwnwn foxxx!"
+        let sequence2 = generate_insert_list(vec![
+            // insert "very " after "the"
+            (4, "very "),
+            // insert "ly" after "quick"
+            (14, "ly"),
+            // insert "u" after the 'o' in "brown"
+            (20, "u"),
+        ], 1);
+        Engine::transform(&mut sequence1, &sequence2);
+        // After sequence2 is applied, we would have "The very quickly brouwn fox"
+        assert_eq!(to_insert_tuple_vec(&sequence1), vec![
+            // Add an "ee" after "the"
+            (3, "ee"),
+            // Add another "k" on the end of "quickly"
+            (18, "k"),
+            // Add "wnwnwn" to the end of "brouwn"
+            (26, "wnwnwn"),
+            // Add "xx!" to the end of "fox"
+            (36, "xx!"),
+        ]);
+        // If sequence 2 is applied after sequence 1, we would have "Theee very quicklyk brouwnwnwnwn foxxx!"
     }
 
-//     #[test]
-//     fn test_transform_insert_insert() {
-//         // Starting with the buffer "The quick brown fox"
-//         let mut sequence1 = generate_insert_list(vec![
-//             // Add an "ee" after "the"
-//             (3, "ee"),
-//             // Add another "k" on the end of "quick"
-//             (11, "k"),
-//             // Add "wnwnwn" to the end of "brown"
-//             (18, "wnwnwn"),
-//             // Add "xx!" to the end of "fox"
-//             (28, "xx!")
-//         ], 2);
-//         // After sequence1 is applied, we would have "Theee quickk brownwnwnwn foxxx!"
-//         let sequence2 = generate_insert_list(vec![
-//             // insert "very " after "the"
-//             (4, "very "),
-//             // insert "ly" after "quick"
-//             (14, "ly"),
-//             // insert "u" after the 'o' in "brown"
-//             (20, "u"),
-//         ], 1);
-//         Engine::transform(&mut sequence1, &sequence2);
-//         // After sequence2 is applied, we would have "The very quickly brouwn fox"
-//         assert_eq!(to_insert_tuple_vec(&sequence1), vec![
-//             // Add an "ee" after "the"
-//             (3, "ee"),
-//             // Add another "k" on the end of "quickly"
-//             (18, "k"),
-//             // Add "wnwnwn" to the end of "brouwn"
-//             (26, "wnwnwn"),
-//             // Add "xx!" to the end of "fox"
-//             (36, "xx!"),
-//         ]);
-//         // If sequence 2 is applied after sequence 1, we would have "Theee very quicklyk brouwnwnwnwn foxxx!"
-//     }
-//
-//     #[test]
-//     fn test_transform_delete_insert(){
-//         // Starting with the buffer "The very quickly brouwn fox"
-//         let mut sequence1 = generate_delete_list(vec![
-//             // delete the "e" from "the"
-//             (2, 1),
-//             // delete the "e" from "very"
-//             (4, 1),
-//             // delete the "ui" from "quickly"
-//             (8, 2),
-//             // delete the "ou" from "brouwn"
-//             (15, 2),
-//             // delete the "o" from "fox"
-//             (19, 1),
-//         ], 1);
-//         // after sequence1 is applied, we would have "Th vry qckly brwn fx"
-//         let sequence2 = generate_insert_list(vec![
-//             // Add an "ee" after "the"
-//             (3, "ee"),
-//             // Add another "k" on the end of "quickly"
-//             (18, "k"),
-//             // Add "wnwnwn" to the end of "brouwn"
-//             (26, "wnwnwn"),
-//             // Add "xx!" to the end of "fox"
-//             (36, "xx!"),
-//         ], 2);
-//         // After sequence2 is applied, we will have "Theee very quicklyk brouwnwnwnwn foxxx!"
-//         Engine::transform(&mut sequence1, &sequence2);
-//         assert_eq!(to_delete_tuple_vec(&sequence1), vec![
-//             // delete the first "e" from "theee"
-//             (2, 1),
-//             // delete the "e" from "very"
-//             (6, 1),
-//             // delete the "ui" from "quicklyk"
-//             (10, 2),
-//             // delete the "ou" from "brouwnwnwnwn"
-//             (18, 2),
-//             // delete the "o" from "foxxx!"
-//             (28, 1),
-//         ]);
-//         // After running sequence1 then sequence2, we get "Thee vry qcklyk brwnwnwnwn fxxx!"
-//     }
-//     #[test]
-//     fn test_transform_delete_delete() {
-//         let _ = env_logger::init();
-//       // Starting with buffer "The quick brown fox jumped over the lazy dog"
-//       let sequence1 =  generate_delete_list(vec![
-//           // Delete "quick bro"
-//           (4, 9),
-//           // Delete "ed over"
-//           (15, 7),
-//           // Delete "laz"
-//           (20, 3),
-//       ], 2);
-//       // After sequence1 is applied, we will have "The wn fox jump the y dog"
-//       let mut sequence2 =  generate_delete_list(vec![
-//           // Delete "he qu"
-//           (1, 5),
-//           // Delete "ck"
-//           (2, 2),
-//           // Delete "rown"
-//           (4, 4),
-//           // Delete "the lazy dog"
-//           (21, 12),
-//       ], 1);
-//       // After sequence2 is applied, we will have "Ti b fox jumped over"
-//       let mut seq1_prime = sequence1.clone();
-//       Engine::transform(&mut seq1_prime, &sequence2);
-//       assert_eq!(to_delete_tuple_vec(&seq1_prime), vec![
-//           // Delete "i b"
-//           (1, 3),
-//           // Delete "ed over"
-//           (10, 7),
-//           // Delete "" (was "laz")
-//           (20, 0),
-//       ]);
-//       Engine::transform(&mut sequence2, &sequence1);
-//       assert_eq!(to_delete_tuple_vec(&sequence2), vec![
-//           // Delete "he "
-//           (1, 3),
-//           // Delete ""
-//           (1, 0),
-//           // Delete "wn"
-//           (1, 2),
-//           // Delete "the "
-//           (11, 4),
-//           // Delete "y dog"
-//           (11, 5),
-//       ]);
-//   }
-//
-//   #[test]
-//   fn test_transform_delete_delete_with_0_length_deletes() {
-//       // Starting with buffer "The quick brown fox jumped over the lazy dog"
-//       let sequence1 = generate_delete_list(vec![
-//           // Delete "h"
-//           (1, 1),
-//           // Delete "" after "T"
-//           (1, 0),
-//           // Delete "ck "
-//           (6, 3),
-//           // Delete "" after "n"
-//           (11, 0),
-//       ], 2);
-//       // After sequence1 is applied, we will have "Te quibrown fox jumped over the lazy dog"
-//       let mut sequence2 = generate_delete_list(vec![
-//           // Delete "e"
-//           (2, 1),
-//           // Delete "c"
-//           (6, 1),
-//           // Delete "ow"
-//           (10, 2),
-//           // Delete "mp"
-//           (18, 2),
-//           // Detete " " after "the
-//           (29, 1),
-//       ], 1);
-//       // After sequence2 is applied, we will have "Th quik brn fox jued over thelazy dog"
-//       Engine::transform(&mut sequence2, &sequence1);
-//       assert_eq!(to_delete_tuple_vec(&sequence2), vec![
-//           // Delete "e"
-//           (1, 1),
-//           // Delete "" (was delete "c")
-//           (5, 0),
-//           // Delete "ow"
-//           (7, 2),
-//           // Delete "mp"
-//           (15, 2),
-//           // Delete " " after "the"
-//           (26, 1),
-//       ]);
-//       // After both have been applied, we will have "T quibrn fox jued over thelazy dog"
-//   }
-//
-//   #[test]
-//   fn test_transform_delete_delete_simple() {
-//       // starting with buffer "The quick brown fox jumped over the lazy dog"
-//       let sequence1 =  generate_delete_list(vec![
-//           // Delete "The"
-//           (0, 3),
-//           // Delete "brown"
-//           (7, 5),
-//           // Delete "jumped"
-//           (12, 6),
-//           // Delete "the"
-//           (18, 3),
-//           // Delete "dog"
-//           (24, 3),
-//       ], 1);
-//       // After these operations run, we will have " quick  fox  over  lazy "
-//       let mut sequence2 =  generate_delete_list(vec![
-//           // Delete "quick"
-//           (4, 5),
-//           // Delete "fox"
-//           (11, 3),
-//           // Delete "over"
-//           (19, 4),
-//           // Delete "lazy"
-//           (24, 4),
-//       ], 2);
-//       // After these operations, we will have "The  brown  jumped  the  dog"
-//       let mut seq1_prime = sequence1.clone();
-//       Engine::transform(&mut seq1_prime, &sequence2);
-//       assert_eq!(to_delete_tuple_vec(&seq1_prime), vec![
-//           // Delete "The"
-//           (0, 3),
-//           // Delete "brown"
-//           (2, 5),
-//           // Delete "jumped"
-//           (4, 6),
-//           // Delete "the"
-//           (6, 3),
-//           // Delete "dog"
-//           (8, 3),
-//       ]);
-//
-//       Engine::transform(&mut sequence2, &sequence1);
-//       assert_eq!(to_delete_tuple_vec(&sequence2), vec![
-//           // Delete "quick"
-//           (1, 5),
-//           // Delete "fox"
-//           (3, 3),
-//           // Delete "over"
-//           (5, 4),
-//           // Delete "lazy"
-//           (7, 4),
-//       ]);
-//   }
-//
+    #[test]
+    fn test_transform_delete_insert(){
+        // Starting with the buffer "The very quickly brouwn fox"
+        let mut sequence1 = generate_delete_list(vec![
+            // delete the "e" from "the"
+            (2, 1),
+            // delete the "e" from "very"
+            (4, 1),
+            // delete the "ui" from "quickly"
+            (8, 2),
+            // delete the "ou" from "brouwn"
+            (15, 2),
+            // delete the "o" from "fox"
+            (19, 1),
+        ], 1);
+        // after sequence1 is applied, we would have "Th vry qckly brwn fx"
+        let sequence2 = generate_insert_list(vec![
+            // Add an "ee" after "the"
+            (3, "ee"),
+            // Add another "k" on the end of "quickly"
+            (18, "k"),
+            // Add "wnwnwn" to the end of "brouwn"
+            (26, "wnwnwn"),
+            // Add "xx!" to the end of "fox"
+            (36, "xx!"),
+        ], 2);
+        // After sequence2 is applied, we will have "Theee very quicklyk brouwnwnwnwn foxxx!"
+        Engine::transform(&mut sequence1, &sequence2);
+        assert_eq!(to_delete_tuple_vec(&sequence1), vec![
+            // delete the first "e" from "theee"
+            (2, 1),
+            // delete the "e" from "very"
+            (6, 1),
+            // delete the "ui" from "quicklyk"
+            (10, 2),
+            // delete the "ou" from "brouwnwnwnwn"
+            (18, 2),
+            // delete the "o" from "foxxx!"
+            (28, 1),
+        ]);
+        // After running sequence1 then sequence2, we get "Thee vry qcklyk brwnwnwnwn fxxx!"
+    }
+    #[test]
+    fn test_transform_delete_delete() {
+      // Starting with buffer "The quick brown fox jumped over the lazy dog"
+      let sequence1 =  generate_delete_list(vec![
+          // Delete "quick bro"
+          (4, 9),
+          // Delete "ed over"
+          (15, 7),
+          // Delete "laz"
+          (20, 3),
+      ], 2);
+      // After sequence1 is applied, we will have "The wn fox jump the y dog"
+      let mut sequence2 =  generate_delete_list(vec![
+          // Delete "he qu"
+          (1, 5),
+          // Delete "ck"
+          (2, 2),
+          // Delete "rown"
+          (4, 4),
+          // Delete "the lazy dog"
+          (21, 12),
+      ], 1);
+      // After sequence2 is applied, we will have "Ti b fox jumped over "
+      let mut seq1_prime = sequence1.clone();
+      Engine::transform(&mut seq1_prime, &sequence2);
+      assert_eq!(to_delete_tuple_vec(&seq1_prime), vec![
+          // Delete "i"
+          (1, 1),
+          // Delete " b"
+          (1, 2),
+          // Delete "ed over"
+          (10, 7),
+          // Delete "" (was "laz")
+          (11, 0),
+      ]);
+      // After both are applied we will have "T fox jump "
+      Engine::transform(&mut sequence2, &sequence1);
+      assert_eq!(to_delete_tuple_vec(&sequence2), vec![
+          // Delete "he "
+          (1, 3),
+          // Delete ""
+          (1, 0),
+          // Delete "wn"
+          (1, 2),
+          // Delete "the "
+          (11, 4),
+          // Delete "y dog"
+          (11, 5),
+      ]);
+  }
+
+  #[test]
+  fn test_transform_delete_delete_with_0_length_deletes() {
+      // Starting with buffer "The quick brown fox jumped over the lazy dog"
+      let sequence1 = generate_delete_list(vec![
+          // Delete "h"
+          (1, 1),
+          // Delete "" after "T"
+          (1, 0),
+          // Delete "ck "
+          (6, 3),
+          // Delete "" after "n"
+          (11, 0),
+      ], 2);
+      // After sequence1 is applied, we will have "Te quibrown fox jumped over the lazy dog"
+      let mut sequence2 = generate_delete_list(vec![
+          // Delete "e"
+          (2, 1),
+          // Delete "c"
+          (6, 1),
+          // Delete "ow"
+          (10, 2),
+          // Delete "mp"
+          (18, 2),
+          // Detete " " after "the
+          (29, 1),
+      ], 1);
+      // After sequence2 is applied, we will have "Th quik brn fox jued over thelazy dog"
+      Engine::transform(&mut sequence2, &sequence1);
+      assert_eq!(to_delete_tuple_vec(&sequence2), vec![
+          // Delete "e"
+          (1, 1),
+          // Delete "" (was delete "c")
+          (5, 0),
+          // Delete "ow"
+          (7, 2),
+          // Delete "mp"
+          (15, 2),
+          // Delete " " after "the"
+          (26, 1),
+      ]);
+      // After both have been applied, we will have "T quibrn fox jued over thelazy dog"
+  }
+
+  #[test]
+  fn test_transform_delete_delete_simple() {
+      // starting with buffer "The quick brown fox jumped over the lazy dog"
+      let sequence1 =  generate_delete_list(vec![
+          // Delete "The"
+          (0, 3),
+          // Delete "brown"
+          (7, 5),
+          // Delete "jumped"
+          (12, 6),
+          // Delete "the"
+          (18, 3),
+          // Delete "dog"
+          (24, 3),
+      ], 1);
+      // After these operations run, we will have " quick  fox  over  lazy "
+      let mut sequence2 =  generate_delete_list(vec![
+          // Delete "quick"
+          (4, 5),
+          // Delete "fox"
+          (11, 3),
+          // Delete "over"
+          (19, 4),
+          // Delete "lazy"
+          (24, 4),
+      ], 2);
+      // After these operations, we will have "The  brown  jumped  the  dog"
+      let mut seq1_prime = sequence1.clone();
+      Engine::transform(&mut seq1_prime, &sequence2);
+      assert_eq!(to_delete_tuple_vec(&seq1_prime), vec![
+          // Delete "The"
+          (0, 3),
+          // Delete "brown"
+          (2, 5),
+          // Delete "jumped"
+          (4, 6),
+          // Delete "the"
+          (6, 3),
+          // Delete "dog"
+          (8, 3),
+      ]);
+
+      Engine::transform(&mut sequence2, &sequence1);
+      assert_eq!(to_delete_tuple_vec(&sequence2), vec![
+          // Delete "quick"
+          (1, 5),
+          // Delete "fox"
+          (3, 3),
+          // Delete "over"
+          (5, 4),
+          // Delete "lazy"
+          (7, 4),
+      ]);
+  }
+
+  #[test]
+  fn test_swap_delete_insert(){
+      // Starting with the buffer "The quick brown fox"
+        let mut sequence1 = generate_insert_list(vec![
+            // insert "very " after "t "
+            (2, "very "),
+            // insert "ly" after "quick"
+            (12, "ly"),
+            // insert "u" before the 'w'  in "wn"
+            (15, "u"),
+        ], 1);
+        // After this runs, we will have "T very quickly uwn ox"
+        let mut sequence2 = generate_delete_list(vec![
+            // Delete the "he" from "the"
+            (1, 2),
+            // Delete "bro" from "brown"
+            (8, 3),
+            // Delete "f" from "fox"
+            (11, 1)
+        ], 2);
+      // After this runs, we will have  "T quick wn ox"
+      Engine::swap(&mut sequence1, &mut sequence2);
+      assert_eq!(to_insert_tuple_vec(&sequence1), vec![
+      // insert "very " after "the "
+      (4, "very "),
+      // insert "ly" after "quick"
+      (14, "ly"),
+      // insert "u" before the 'w'  in "wn"
+      (20, "u"),
+      ]);
+      // After this runs, we will have "The very quickly brouwn fox"
+      assert_eq!(to_delete_tuple_vec(&sequence2), vec![
+      // Delete the "he" from "the"
+      (1, 2),
+      // Delete "bro" from "brown"
+      (15, 3),
+      // Delete "f" from "fox"
+      (19, 1)
+      ]);
+      // After this runs, we will have "T very quickly uwn ox"
+  }
+
+  #[test]
+  fn test_swap_delete_delete(){
+          // starting with buffer "The quick brown fox jumped over the lazy dog"
+          let mut sequence1 = generate_delete_list(vec![
+              // Delete "The"
+              (0, 3),
+              // Delete "brown"
+              (2, 5),
+              // Delete "jumped"
+              (4, 6),
+              // Delete "the"
+              (6, 3),
+              // Delete "dog"
+              (8, 3),
+          ], 1);
+          // After these operations run, we will have " quick  fox  over  lazy "
+          let mut sequence2 = generate_delete_list(vec![
+              // Delete "quick"
+              (4, 5),
+              // Delete "fox"
+              (11, 3),
+              // Delete "over"
+              (19, 4),
+              // Delete "lazy"
+              (24, 4),
+          ], 2);
+          // After these operations, we will have "The  brown  jumped  the  dog"
+
+          Engine::swap(&mut sequence1, &mut sequence2);
+          assert_eq!(to_delete_tuple_vec(&sequence1), vec![
+              // Delete "The"
+              (0, 3),
+              // Delete "brown"
+              (7, 5),
+              // Delete "jumped"
+              (12, 6),
+              // Delete "the"
+              (18, 3),
+              // Delete "dog"
+              (24, 3),
+          ]);
+
+          assert_eq!(to_delete_tuple_vec(&sequence2), vec![
+              // Delete "quick"
+              (1, 5),
+              // Delete "fox"
+              (3, 3),
+              // Delete "over"
+              (5, 4),
+              // Delete "lazy"
+              (7, 4),
+          ]);
+      }
+      #[test]
+      fn test_swap_delete_delete_with_overlap() {
+          // starting with buffer "The quick brown fox jumped over the lazy dog"
+          let mut sequence1 = generate_delete_list(vec![
+              // Delete "The  brown"
+              (0, 10),
+              // Delete "jumped  the  dog"
+              (2, 16),
+          ], 1);
+          // After these operations run, we will have " "
+          let mut sequence2 = generate_delete_list(vec![
+              // Delete "quick"
+              (4, 5),
+              // Delete "fox"
+              (11, 3),
+              // Delete "over"
+              (19, 4),
+              // Delete "lazy"
+              (24, 4),
+          ], 2);
+          // After these operations, we will have "The  brown  jumped  the  dog"
+
+          Engine::swap(&mut sequence1, &mut sequence2);
+          assert_eq!(to_delete_tuple_vec(&sequence1), vec![
+              // Delete "The "
+              (0, 4),
+              // Delete " brown"
+              (5, 6),
+              // Delete "jumped "
+              (10, 7),
+              // Delete " the "
+              (14, 5),
+              // Delete " dog"
+              (18, 4),
+          ]);
+          // After these, we will have "quick fox overlazy"
+          assert_eq!(to_delete_tuple_vec(&sequence2), vec![
+              // Delete "quick"
+              (0, 5),
+              // Delete "fox"
+              (1, 3),
+              // Delete "over"
+              (2, 4),
+              // Delete "lazy"
+              (2, 4),
+          ]);
+      }
+
+      #[test]
+      fn test_integrate_sequences(){
+          let _ = env_logger::init().unwrap();
+          let mut engine = Engine::new(1);
+          engine.inserts = generate_insert_list(vec![
+              (0, "The quick brown fox"),
+              // insert "very " after "the"
+              (4, "very "),
+              // insert "ly" after "quick"
+              (14, "ly"),
+              // insert "u" after the 'o' in "brown"
+              (20, "u"),
+          ], 1);
+          // After the inserts are applied, we would have "The very quickly brouwn fox"
+
+          engine.deletes = generate_delete_list(vec![
+              // delete the "e" from "the"
+              (2, 1),
+              // delete the "e" from "very"
+              (4, 1),
+              // delete the "ui" from "quickly"
+              (8, 2),
+              // delete the "ou" from "brouwn"
+              (15, 2),
+              // delete the "o" from "fox"
+              (19, 1),
+          ], 1);
+
+          // After the deletes are applied, we would have "Th vry qckly brwn fx"
+
+          let mut sequence = TransactionSequence::new(Some(State::new(1, 0, 0)), 2, generate_insert_list(vec![
+              // Add an "ee" after "the"
+              (3, "ee"),
+              // Add another "k" on the end of "quick"
+              (11, "k"),
+              // Add "wnwnwn" to the end of "brown"
+              (18, "wnwnwn"),
+              // Add "xx!" to the end of "fox"
+              (28, "xx!"),
+          ], 2), generate_delete_list(vec![  // After the inserts, we would have "Theee quickk brownwnwnwn foxxx!"
+              // Delete the "he" from "theee"
+              (1, 2),
+              // Delete "bro" from "brownwnwnwn"
+              (11, 3),
+              // Delete "f" from "foxxx"
+              (20, 1)
+          ], 2));
+          // After the deletes, we would have "Tee quickk wnwnwnwn oxxx!"
+
+          engine.integrate_remote(&mut sequence).unwrap();
+
+          assert_eq!(to_insert_tuple_vec(&sequence.inserts), vec![
+              // Add an "ee" after "th"
+              (2, "ee"),
+              // Add a "k" after "qckly"
+              (14, "k"),
+              // Add a "wnwnwn" after "brwn"
+              (20, "wnwnwn"),
+              // Add "xx!" after "fx"
+              (29, "xx!")
+          ]);
+          // After these are applied, we would have "Thee vry qcklyk brwnwnwnwn fxxx!"
+          assert_eq!(to_delete_tuple_vec(&sequence.deletes), vec![
+              // Delete the "h" in "thee"
+              (1, 1),
+              // Delete "br"
+              (15, 2),
+              // Delete "f"
+              (24, 1)
+          ]);
+          // After these are applied, we would have "Tee vry qcklyk wnwnwnwn xxx!"
+
+          assert_eq!(to_insert_tuple_vec(&engine.inserts), vec![
+              (0, "The quick brown fox"),
+              // Add an "ee" after "the"
+              (3, "ee"),
+              // insert "very " after "theee "
+              (6, "very "),
+              // insert "ly" after "quick"
+              (16, "ly"),
+              // Add another "k" on the end of "quick"
+              (18, "k"),
+              // insert "u" after the 'o' in "brown"
+              (23, "u"),
+              // Add "wnwnwn" to the end of "brown"
+              (26, "wnwnwn"),
+              // Add "xx!" to the end of "fox"
+              (36, "xx!"),
+          ]);
+          // After all the inserts are applied, we should have "Theee very quicklyk brouwnwnwnwn foxxx!"
+          assert_eq!(to_delete_tuple_vec(&engine.deletes), vec![
+              // Delete the "h" from "thee"
+              (1, 1),
+              // delete the first "e" from "teee"
+              (1, 1),
+              // delete the "e" from "very"
+              (5, 1),
+              // delete the "ui" from "quicklyk"
+              (9, 2),
+              // Delete "br" from "brouwnwnwnwn"
+              (15, 2),
+              // delete the "ou" from "brouwn"
+              (15, 2),
+              // Delete "f" from "foxxx!"
+              (24, 1),
+              // delete the "o" from "oxxx!"
+              (24, 1),
+          ]);
+          // After all the deletes are applied, we should have "Tee vry qcklyk wnwnwnwn xxx!"
+      }
+      #[test]
+      fn test_process_transaction() {
+        let mut engine = Engine::new(1);
+        engine.inserts = generate_insert_list(vec![
+            (0, "The quick brown fox"),
+            // insert "very " after "the"
+            (4, "very "),
+            // insert "ly" after "quick"
+            (14, "ly"),
+            // insert "u" after the 'o' in "brown"
+            (20, "u"),
+        ], 1);
+        // After the inserts are applied, we would have "The very quickly brouwn fox"
+
+        engine.deletes = generate_delete_list(vec![
+            // delete the "e" from "the"
+            (2, 1),
+            // delete the "e" from "very"
+            (4, 1),
+            // delete the "ui" from "quickly"
+            (8, 2),
+            // delete the "ou" from "brouwn"
+            (15, 2),
+            // delete the "o" from "fox"
+            (19, 1),
+        ], 1);
+
+        // After the deletes are applied, we would have "Th vry qckly brwn fx"
+
+        let mut sequence = TransactionSequence::new(Some(State::new(1, 0, 0)), 2, generate_insert_list(vec![
+            // Add an "ee" after "th"
+            (2, "ee"),
+            // Add another "k" on the end of "quickly"
+            (14, "k"),
+            // Add "wnwnwn" to the end of "brown"
+            (20, "wnwnwn"),
+            // Add "xx!" to the end of "fox"
+            (29, "xx!"),
+            // After the inserts, we would have "Thee vry qcklyk brwnwnwnwn fxxx!"
+        ], 2), generate_delete_list(vec![
+            // Delete the "h" from "thee"
+            (1, 1),
+            // Delete "br" from "brwnwnwnwn"
+            (15, 2),
+            // Delete "f" from "foxxx!"
+            (24, 1)
+        ], 2));
+        // After the deletes, we would have "Tee vry qcklyk wnwnwnwn oxxx!"
+
+        engine.process_transaction(&mut sequence);
+
+        assert_eq!(to_insert_tuple_vec(&sequence.inserts), vec![
+            // Add an "ee" after "th"
+            (3, "ee"),
+            // Add a "k" after "qckly"
+            (18, "k"),
+            // Add a "wnwnwn" after "brwn"
+            (26, "wnwnwn"),
+            // Add "xx!" after "fx"
+            (36, "xx!")
+        ]);
+        // After the inserts are applied, we would have "Theee very quicklyk brouwnwnwnwn foxxx!"
+        assert_eq!(to_delete_tuple_vec(&sequence.deletes), vec![
+            // Delete the "h" in "theee"
+            (1, 1),
+            // Delete "br"
+            (19, 2),
+            // Delete "f"
+            (30, 1)
+        ]);
+        // After these are applied, we would have "Teee very quicklyk ouwnwnwnwn oxxx!"
+
+        assert_eq!(to_insert_tuple_vec(&engine.inserts), vec![
+            (0, "The quick brown fox"),
+            // Add an "ee" after "the"
+            (3, "ee"),
+            // insert "very " after "theee "
+            (6, "very "),
+            // insert "ly" after "quick"
+            (16, "ly"),
+            // Add another "k" on the end of "quick"
+            (18, "k"),
+            // insert "u" after the 'o' in "brown"
+            (23, "u"),
+            // Add "wnwnwn" to the end of "brown"
+            (26, "wnwnwn"),
+            // Add "xx!" to the end of "fox"
+            (36, "xx!"),
+
+        ]);
+        // After all the inserts are applied, we should have "Theee very quicklyk brouwnwnwnwn foxxx!"
+        assert_eq!(to_delete_tuple_vec(&engine.deletes), vec![
+            // Delete the "h" from "thee"
+            (1, 1),
+            // delete the first "e" from "teee"
+            (1, 1),
+            // delete the "e" from "very"
+            (5, 1),
+            // delete the "ui" from "quicklyk"
+            (9, 2),
+            // Delete "br" from "brouwnwnwnwn"
+            (15, 2),
+            // delete the "ou" from "brouwn"
+            (15, 2),
+            // Delete "f" from "foxxx!"
+            (24, 1),
+            // delete the "o" from "oxxx!"
+            (24, 1),
+        ]);
+        // After all the deletes are applied, we should have "Tee vry qcklyk wnwnwnwn xxx!"
+    }
+
 }
