@@ -1,5 +1,6 @@
 Optra
 =====
+[![Build Status](https://travis-ci.org/dyule/optra.svg?branch=master)](https://travis-ci.org/dyule/optra)
 
 Optra is a Rust package allowing for remote file synchronization.  It provides the algorithms necessary to keep files in sync, but not the transmission or file change detection needed.  These are provided by [wamp-rs](https://github.com/dyule/wamp-rs) and  [rdiff](https://github.com/dyule/rdiff) respectively, or you can use your own mechanism.
 
