@@ -11,7 +11,7 @@ Optra is licensed using the MIT license (see [LICENSE](LICENSE))
 [Documentation](https://dyule.github.io/optra/optra/)
 
 # Usage
- The engine is based on the Admissabilty Based Sequence Transformation algorithm (doi: [10.1109/TPDS.2010.64](http://dx.doi.org.ezproxy.library.dal.ca/10.1109/TPDS.2010.64))
+ The engine is based on the Admissabilty Based Sequence Transformation algorithm (doi: [10.1109/TPDS.2010.64](http://dx.doi.org.ezproxy.library.dal.ca/10.1109/TPDS.2010.64)), which is a type of Operational Transformation.
  The idea is that each site that wants to have a file synchronized will have an instance of [`Engine`](engine/struct.Engine.html) running.
  Any changes that are made to teh file should be run through the engine using either `process_diffs()` or `process_transaction()` prior to being broadcast.
  Any changes that are made at a remote site should be run through the engine using `integrate_remote()` prior to being applied to the file.
