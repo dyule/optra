@@ -47,22 +47,22 @@
                    <a id="toggle-all-docs" href="javascript:void(0)" title="collapse all docs">
                        [<span class='inner'>&#x2212;</span>]
                    </a>
-               </span><a id='src-12' class='srclink' href='../src/optra/src/operations.rs.html#6-20' title='goto source code'>[src]</a></span></h1>
-<pre class='rust trait'>pub trait Operation: <a class='trait' href='https://doc.rust-lang.org/nightly/core/fmt/trait.Debug.html' title='core::fmt::Debug'>Debug</a> + <a class='trait' href='https://doc.rust-lang.org/nightly/core/cmp/trait.Ord.html' title='core::cmp::Ord'>Ord</a> + <a class='trait' href='https://doc.rust-lang.org/nightly/core/clone/trait.Clone.html' title='core::clone::Clone'>Clone</a> {
-    fn <a href='#tymethod.get_state' class='fnname'>get_state</a>(&amp;self) -&gt; &amp;<a class='struct' href='../optra/struct.State.html' title='optra::State'>State</a>;
-    fn <a href='#tymethod.get_state_mut' class='fnname'>get_state_mut</a>(&amp;mut self) -&gt; &amp;mut <a class='struct' href='../optra/struct.State.html' title='optra::State'>State</a>;
+               </span><a id='src-13' class='srclink' href='../src/optra/src/operations.rs.html#8-28' title='goto source code'>[src]</a></span></h1>
+<pre class='rust trait'>pub trait Operation: <a class='trait' href='https://doc.rust-lang.org/nightly/core/fmt/trait.Debug.html' title='core::fmt::Debug'>Debug</a> + <a class='trait' href='https://doc.rust-lang.org/nightly/core/clone/trait.Clone.html' title='core::clone::Clone'>Clone</a> {
     fn <a href='#tymethod.get_position' class='fnname'>get_position</a>(&amp;self) -&gt; <a class='primitive' href='https://doc.rust-lang.org/nightly/std/primitive.u64.html'>u64</a>;
     fn <a href='#tymethod.get_increment' class='fnname'>get_increment</a>(&amp;self) -&gt; <a class='primitive' href='https://doc.rust-lang.org/nightly/std/primitive.i64.html'>i64</a>;
+    fn <a href='#tymethod.get_timestamp' class='fnname'>get_timestamp</a>(&amp;self) -&gt; <a class='primitive' href='https://doc.rust-lang.org/nightly/std/primitive.u32.html'>u32</a>;
+    fn <a href='#tymethod.set_timestamp' class='fnname'>set_timestamp</a>(&amp;mut self, new_timestamp: <a class='primitive' href='https://doc.rust-lang.org/nightly/std/primitive.u32.html'>u32</a>);
 }</pre><div class='docblock'><p>An operation that will make a change to a file.</p>
 </div>
             <h2 id='required-methods'>Required Methods</h2>
             <div class='methods'>
-        <h3 id='tymethod.get_state' class='method stab '><code>fn <a href='#tymethod.get_state' class='fnname'>get_state</a>(&amp;self) -&gt; &amp;<a class='struct' href='../optra/struct.State.html' title='optra::State'>State</a></code></h3><div class='docblock'><p>Gets the <a href="struct.State.html"><code>State</code></a> that this operation was performed on</p>
-</div><h3 id='tymethod.get_state_mut' class='method stab '><code>fn <a href='#tymethod.get_state_mut' class='fnname'>get_state_mut</a>(&amp;mut self) -&gt; &amp;mut <a class='struct' href='../optra/struct.State.html' title='optra::State'>State</a></code></h3><div class='docblock'><p>Gets the <a href="struct.State.html"><code>State</code></a> that this operation was performed on mutably.</p>
-</div><h3 id='tymethod.get_position' class='method stab '><code>fn <a href='#tymethod.get_position' class='fnname'>get_position</a>(&amp;self) -&gt; <a class='primitive' href='https://doc.rust-lang.org/nightly/std/primitive.u64.html'>u64</a></code></h3><div class='docblock'><p>Gets the position this operation will be perfomed at</p>
+        <h3 id='tymethod.get_position' class='method stab '><code>fn <a href='#tymethod.get_position' class='fnname'>get_position</a>(&amp;self) -&gt; <a class='primitive' href='https://doc.rust-lang.org/nightly/std/primitive.u64.html'>u64</a></code></h3><div class='docblock'><p>Gets the position this operation will be perfomed at</p>
 </div><h3 id='tymethod.get_increment' class='method stab '><code>fn <a href='#tymethod.get_increment' class='fnname'>get_increment</a>(&amp;self) -&gt; <a class='primitive' href='https://doc.rust-lang.org/nightly/std/primitive.i64.html'>i64</a></code></h3><div class='docblock'><p>Gets the size change this operation will perform.  For insert operations, it&#39;s the
 length of the data they will insert.  For delete operations, it&#39;s the length
 of the data they will delete</p>
+</div><h3 id='tymethod.get_timestamp' class='method stab '><code>fn <a href='#tymethod.get_timestamp' class='fnname'>get_timestamp</a>(&amp;self) -&gt; <a class='primitive' href='https://doc.rust-lang.org/nightly/std/primitive.u32.html'>u32</a></code></h3><div class='docblock'><p>Gets the current local timestamp of this operation</p>
+</div><h3 id='tymethod.set_timestamp' class='method stab '><code>fn <a href='#tymethod.set_timestamp' class='fnname'>set_timestamp</a>(&amp;mut self, new_timestamp: <a class='primitive' href='https://doc.rust-lang.org/nightly/std/primitive.u32.html'>u32</a>)</code></h3><div class='docblock'><p>Sets the local timestamp of this operation</p>
 </div></div>
         <h2 id='implementors'>Implementors</h2>
         <ul class='item-list' id='implementors-list'>
