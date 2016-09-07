@@ -1,13 +1,16 @@
-use std::collections::LinkedList;
-use std::cmp::Ordering;
+use std::collections::linked_list::{LinkedList};
+use std::collections::hash_map::{HashMap, Entry};
+use std::collections::btree_map::{BTreeMap};
+use std::collections::vec_deque::VecDeque;
 use std::fs::{File};
-use std::path::Path;
-use std::io::{self, Read, Write};
-use operations::{State, Operation, InsertOperation, DeleteOperation, Advance, OperationInternal};
-use ::{OTError, ErrorKind as Kind, Offset, Position};
-use utils::{SequenceTransformer, SequenceSwapper};
+use std::io::{self, Read, Write, Seek, SeekFrom};
 use std::mem;
+use std::fmt;
+use operations::{Operation, InsertOperation, DeleteOperation, Advance, OperationInternal};
+use ::{OTError, ErrorKind as Kind, Offset, Position};
+use utils::{SequenceTransformer, SequenceSwapper, SequenceSplitter};
 use rdiff::Diff;
+use byteorder::{NetworkEndian, ByteOrder};
 
 /// Process file change operations in such a way that they can be synchronized across sites
 ///
@@ -18,13 +21,10 @@ use rdiff::Diff;
 /// or `process_transaction()` (If the operations are already stored in a [`TransactionSequence`](struct.TransactionSequence.html)) and pass any remote edits received into `integrate_remote()`.
 ///
 /// See the module level documentation for an example.
+#[derive(Clone)]
 pub struct Engine {
     /// The unique ID for this site
     site_id: u32,
-
-    /// The state of the most recently applied operation,
-    /// or none if no operations have been applied
-    last_state: Option<State>,
 
     /// The inserts for this site, stored in effect order
     inserts: LinkedList<InsertOperation>,
@@ -32,8 +32,17 @@ pub struct Engine {
     /// The deletes for this site, stored in effect order
     deletes: LinkedList<DeleteOperation>,
 
-    /// The timestamp for operations that have already been integrated into the history
-    time_stamp: u32
+}
+
+/// Tracks the relationship between local timestamps and the timestamp on remote machines.
+#[derive(Debug)]
+pub struct TimeStamper {
+    /// A mapping between the remote id of a transaction and its local timstamp
+    time_mapping: HashMap<(u32, u32), u32>,
+
+    /// The most recently used timestamp
+    last_timestamp: Option<(u32, (u32, u32))>
+
 }
 
 /// Represents a sequence of transactions that can be performed on a file.
@@ -41,19 +50,16 @@ pub struct Engine {
 /// The operations are stored in the order they occur in the file, and each operation
 /// assumes the previous operations have taken place.  Furthermore, the insertion operations are
 /// assumed to take place prior to the deletion operations.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TransactionSequence {
-    /// The state that this sequence started with
-    starting_state: Option<State>,
-
-    /// The site that this sequence originated from
-    original_site: u32,
+    /// Last time stamp assigned before the operations in this sequence were performed
+    last_timestamp: Option<(u32, u32)>,
 
     /// The inserts for this sequence, stored in effect order
-    inserts: LinkedList<InsertOperation>,
+    pub inserts: LinkedList<InsertOperation>,
 
     /// The deletes for this sequence, stored in effect order
-    deletes: LinkedList<DeleteOperation>,
+    pub deletes: LinkedList<DeleteOperation>,
 }
 
 // Public methods
@@ -64,53 +70,47 @@ impl Engine {
     pub fn new(site_id: u32) -> Engine {
         Engine {
             site_id: site_id,
-            last_state: None,
             inserts: LinkedList::new(),
             deletes: LinkedList::new(),
-            time_stamp: 0
         }
     }
 
     /// Convert the diffs we got from analyzing a file into a TransactionSequence
     /// we can send to another site for synchronization.
-    pub fn process_diffs(&mut self, diff: Diff) -> TransactionSequence {
-        let last_state = self.last_state.clone();
+    pub fn process_diffs(&mut self, diff: Diff, stamper: &mut TimeStamper) -> (TransactionSequence, BTreeMap<u32, (u32, u32)>) {
+        let current_timestamp = stamper.get_last_timestamp();
+        let new_timestamp = stamper.stamp_local(self.site_id);
         let inserts = diff.inserts().map(|insert| {
-            let i = InsertOperation::new(
+            InsertOperation::new(
                 insert.get_position()as Position,
                 insert.get_data().clone(),
-                State::new(self.site_id, self.time_stamp, self.time_stamp)
-            );
-            self.time_stamp += 1;
-            i
+                new_timestamp,
+                self.site_id,
+            )
         }).collect();
 
 
         let deletes = diff.deletes().map(|delete| {
-            let d = DeleteOperation::new(
+            DeleteOperation::new(
                 delete.get_position() as Position,
                 delete.get_length() as Position,
-                State::new(self.site_id, self.time_stamp, self.time_stamp)
-            );
-            self.time_stamp += 1;
-            d
+                new_timestamp
+            )
         }).collect();
-
-        let mut sequence = TransactionSequence::new(last_state, self.site_id, inserts, deletes);
+        let mut lookup = BTreeMap::new();
+        lookup.insert(new_timestamp, (self.site_id, new_timestamp));
+        let mut sequence = TransactionSequence::new(current_timestamp.map(|(_local, remote)| remote), inserts, deletes);
         self.process_transaction(&mut sequence);
-        if self.time_stamp > 0 {
-            self.last_state = Some(State::new(self.site_id, self.time_stamp - 1, self.time_stamp -1 ));
-        }
-        sequence
+        (sequence, lookup)
     }
 
     /// Integrates the sequence of operations given by `remote_sequence` into the local history.  The ordering
     /// properties of the local history will be maintained, and a sequence of operations that
     /// can be applied to the local state will be returned.
-    pub fn integrate_remote(&mut self, remote_sequence: &mut TransactionSequence) -> Result<(), OTError> {
+    pub fn integrate_remote(&mut self, remote_sequence: &mut TransactionSequence, lookup: &BTreeMap<u32, (u32, u32)>, stamper: &mut TimeStamper) -> Result<(), OTError> {
 
         //Get all the local inserts that have happened since the last sync with the remote site
-        let local_concurrent_inserts = try!(self.get_concurrent_inserts(&remote_sequence.starting_state, remote_sequence.original_site));
+        let local_concurrent_inserts = try!(self.get_concurrent_inserts(&remote_sequence, lookup, stamper));
         // Transform the remote inserts so that they account for the changes from the local inserts
         Engine::transform(&mut remote_sequence.inserts, &local_concurrent_inserts);
 
@@ -121,7 +121,7 @@ impl Engine {
         // Transform the remote inserts so that they account for the changes from the local deletes
         Engine::transform(&mut remote_sequence.inserts, &self.deletes);
 
-        self.assign_timestamps(&mut transformed_remote_inserts);
+        self.assign_timestamps(&mut transformed_remote_inserts, lookup, stamper);
 
         // Merge the transformed remote inserts with the local.  Note that we use the inserts that have not been
         // transformed by deletes, as the local inserts always preceded the deletes.
@@ -130,7 +130,7 @@ impl Engine {
         // Adjust the local deletes with the remote inserts that have been merged into the local inserts
         Engine::transform(&mut self.deletes, &transformed_remote_inserts);
         // Transform the remote deletes with all of the local inserts that happened since the last sync
-        let transformed_concurrent_inserts = try!(self.get_concurrent_inserts(&remote_sequence.starting_state, remote_sequence.original_site));
+        let transformed_concurrent_inserts = try!(self.get_concurrent_inserts(&remote_sequence, lookup, stamper));
 
         Engine::transform(&mut remote_sequence.deletes, &transformed_concurrent_inserts);
         trace!("Sequence: {:?}", remote_sequence);
@@ -139,7 +139,7 @@ impl Engine {
         Engine::transform(&mut remote_sequence.deletes, &self.deletes);
         trace!("Sequence: {:?}", remote_sequence);
 
-        self.assign_timestamps(&mut remote_sequence.deletes);
+        self.assign_timestamps(&mut remote_sequence.deletes, &lookup, stamper);
 
         // Merge the remote deletes that have taken all the local operations into effect with the local deletes
          Engine::merge_sequences(&mut self.deletes, &mut remote_sequence.deletes);
@@ -153,61 +153,166 @@ impl Engine {
     /// operations in the transaction must also be effect order, with the inserts preceding the deletes.
     pub fn process_transaction(&mut self, outgoing_sequence: &mut TransactionSequence) {
 
-    // Swap the execution order of the outgoing insert operations so that they happen before the local deletes
-    Engine::swap(&mut outgoing_sequence.inserts, &mut self.deletes);
+        Engine::split_by(&mut outgoing_sequence.deletes, &self.deletes);
 
-    let original_deletes = outgoing_sequence.deletes.clone();
-    // Swap the execution order of the outgoing delete operations so they happen before the local deletes
-    Engine::swap(&mut outgoing_sequence.deletes, &mut self.deletes.clone());
+        // Swap the execution order of the outgoing insert operations so that they happen before the local deletes
+        Engine::swap(&mut outgoing_sequence.inserts, &mut self.deletes);
 
-    // Record that we've performed the outgoing insertion operations
-    Engine::merge_sequences(&mut self.inserts, &outgoing_sequence.inserts);
+        let original_deletes = outgoing_sequence.deletes.clone();
+        // Swap the execution order of the outgoing delete operations so they happen before the local deletes
+        Engine::swap(&mut outgoing_sequence.deletes, &mut self.deletes.clone());
 
-    // Record that we've performed the outgoing delete operations
-    Engine::merge_sequences(&mut self.deletes, &original_deletes);
+        // Record that we've performed the outgoing insertion operations
+        Engine::merge_sequences(&mut self.inserts, &outgoing_sequence.inserts);
 
+        // Record that we've performed the outgoing delete operations
+        Engine::merge_sequences(&mut self.deletes, &original_deletes);
+
+    }
+
+    // /// Gets the state this engine saw last
+    // pub fn get_last_state(&self) -> &Option<State> {
+    //     &self.last_state
+    // }
+
+    /// Get all the operations since, but not including the given state
+    pub fn get_operations_since(&self, remote_state: Option<(u32, u32)>, stamper: &TimeStamper) -> Result<TransactionSequence, OTError> {
+        if let Some((remote_site_id, remote_timestamp)) = remote_state {
+            let reference_time = try!(stamper.get_local_timestamp_for(remote_site_id, remote_timestamp)
+                                               .ok_or(OTError::new(Kind::NoSuchState)));
+
+
+            let inserts = self.inserts.iter().filter(|o| o.get_timestamp() > reference_time).cloned().collect();
+            let deletes = self.deletes.iter().filter(|o| o.get_timestamp() > reference_time).cloned().collect();
+            Ok(TransactionSequence::new(Some((remote_site_id, remote_timestamp)), inserts, deletes))
+        } else {
+            Ok(TransactionSequence::new(None, self.inserts.iter().cloned().collect(), self.deletes.iter().cloned().collect()))
+        }
+    }
+
+    /// Compress this engine and write to `writer`.  The output can then be expanded
+    /// back into an equivilent Engine using `expand_from()`
+    pub fn compress_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let mut int_buf = [0;4];
+        NetworkEndian::write_u32(&mut int_buf, self.inserts.len() as u32);
+        try!(writer.write(&mut int_buf));
+        for insert in self.inserts.iter() {
+            try!(insert.compress_to(writer, true));
+        }
+        NetworkEndian::write_u32(&mut int_buf, self.deletes.len() as u32);
+        try!(writer.write(&mut int_buf));
+        for delete in self.deletes.iter() {
+            try!(delete.compress_to(writer));
+        }
+        Ok(())
+    }
+
+    /// Expand this engine from previously compressed data in `reader`.  The data in reader
+    /// should have been written using `compress_to()`
+    pub fn expand_from<R: Read>(reader: &mut R, site_id: u32) -> io::Result<Engine> {
+        trace!("Expanding engine");
+        // let mut bool_buffer = [0;1];
+        // trace!("Reading state");
+        // try!(reader.read_exact(&mut bool_buffer));
+        // let (state, time_stamp) = if bool_buffer[0] == 1 {
+        //     let state = try!(State::expand_from(reader));
+        //     let time_stamp = state.get_time() + 1;
+        //     (Some(state), time_stamp)
+        // } else {
+        //     (None, 0)
+        // };
+        // trace!("State read: {:?}", state);
+        let mut int_buf = [0;4];
+        trace!("Reading insert length");
+        try!(reader.read_exact(&mut int_buf));
+        let insert_len = NetworkEndian::read_u32(&int_buf);
+        trace!("Insert length was: {}", insert_len);
+        let inserts = (0..insert_len).map(|_|InsertOperation::expand_from(reader, None).unwrap()).collect();
+        trace!("Read inserts");
+        trace!("Reading delete length");
+        try!(reader.read_exact(&mut int_buf));
+        let delete_len = NetworkEndian::read_u32(&int_buf);
+        trace!("Delete length was: {}", delete_len);
+        let deletes = (0..delete_len).map(|_|DeleteOperation::expand_from(reader).unwrap()).collect();
+        trace!("Read deletes");
+
+        Ok(Engine {
+            site_id: site_id,
+            inserts: inserts,
+            deletes: deletes,
+        })
     }
 }
 
 // Private methods
 impl Engine {
-    fn get_concurrent_inserts(&self, starting_state: &Option<State>, original_site: u32) -> Result<LinkedList<InsertOperation>, OTError> {
-        if let &Some(ref starting_state) = starting_state {
-            let reference_time = match self.inserts.iter().find(|o| o.get_state().matches(starting_state)) {
-                Some(ref o) => o.get_state().get_time(),
-                None => {
-                    match self.deletes.iter().find(|o| o.get_state().matches(starting_state)) {
-                        Some(ref o) => o.get_state().get_time(),
-                        None => return Err(OTError::new(Kind::NoSuchState))
-                    }
-                }
-            };
 
-            Ok(self.inserts.iter().filter(|o| o.get_state().happened_after(reference_time, original_site)).map(|o| o.clone()).collect())
+
+    fn get_concurrent_inserts(&self, remote_sequence: &TransactionSequence, lookup: &BTreeMap<u32, (u32, u32)>, stamper: &TimeStamper) -> Result<LinkedList<InsertOperation>, OTError> {
+        let mut tail_timestamp = None;
+        for insert in remote_sequence.inserts.iter() {
+            let timestamp = insert.get_timestamp();
+            if let Some((local, _remote)) = tail_timestamp {
+
+                if timestamp < local {
+                    tail_timestamp = Some((timestamp, try!(lookup.get(&timestamp).ok_or(OTError::new(Kind::NoSuchState)))))
+                }
+            } else {
+                tail_timestamp = Some((timestamp, try!(lookup.get(&timestamp).ok_or(OTError::new(Kind::NoSuchState)))))
+            }
+        }
+        for delete in remote_sequence.deletes.iter() {
+            let timestamp = delete.get_timestamp();
+            if let Some((local, _remote)) = tail_timestamp {
+
+                if timestamp < local {
+                    tail_timestamp = Some((timestamp, try!(lookup.get(&timestamp).ok_or(OTError::new(Kind::NoSuchState)))))
+                }
+            } else {
+                tail_timestamp = Some((timestamp, try!(lookup.get(&timestamp).ok_or(OTError::new(Kind::NoSuchState)))))
+            }
+        }
+        let tail_timestamp = tail_timestamp.map(|(_, &(site_id, timestamp))| stamper.get_local_timestamp_for(site_id, timestamp).unwrap());
+        trace!("Getting inserts after {:?} and before {:?}", remote_sequence.last_timestamp, tail_timestamp);
+        if let Some((remote_site_id, remote_timestamp)) = remote_sequence.last_timestamp {
+            let reference_time = try!(stamper.get_local_timestamp_for(remote_site_id, remote_timestamp)
+                                               .ok_or(OTError::new(Kind::NoSuchState)));
+            Ok(self.inserts.iter().filter(|o|
+                if let Some(tail) = tail_timestamp {
+                    o.get_timestamp() > reference_time && o.get_timestamp() < tail
+                } else {
+                    o.get_timestamp() > reference_time
+                }).cloned().collect())
         } else {
-            Ok(self.inserts.clone())
+            Ok(self.inserts.iter().filter(|o|
+                if let Some(tail) = tail_timestamp {
+                    o.get_timestamp() < tail
+                } else {
+                    true
+                }).cloned().collect())
         }
 
     }
 
-    fn assign_timestamps<O: Operation>(&mut self, sequence: &mut LinkedList<O>) {
-        for o in sequence {
-            o.get_state_mut().set_time(self.time_stamp);
-            self.time_stamp += 1;
+    fn assign_timestamps<O: Operation>(&mut self, sequence: &mut LinkedList<O>, timestamp_lookup: &BTreeMap<u32, (u32, u32)>, stamper: &mut TimeStamper) {
+        trace!("Assigning time_stamps to {:?}", sequence);
+        for o in sequence.iter_mut() {
+            // TODO add better error handling here.
+            let &(remote_site_id, remote_timestamp) = timestamp_lookup.get(&o.get_timestamp()).unwrap();
+            let local_timestamp = stamper.stamp_remote(remote_site_id, remote_timestamp);
+            o.set_timestamp(local_timestamp)
         }
-        if self.time_stamp > 0 {
-            self.last_state = Some(State::new(self.site_id, self.time_stamp - 1, self.time_stamp -1 ));
-        }
+        trace!("Timestamps assigned to {:?}", sequence);
     }
 
     fn transform<O1: OperationInternal, O2: OperationInternal>(incoming_sequence: &mut LinkedList<O1>, existing_sequence: &LinkedList<O2>)  {
+        trace!("Transforming {:?} by {:?}", incoming_sequence, existing_sequence);
         let mut incoming_iter = incoming_sequence.iter_mut();
         let mut existing_iter = existing_sequence.iter();
         let mut saved_op = None;
         let mut incoming_op = incoming_iter.next();
         let mut existing_op = existing_iter.next();
         let mut transformer = SequenceTransformer::new();
-        println!("Loop Starting");
         loop {
 
             let advance_action = if let Some(existing_op) = existing_op {
@@ -256,36 +361,67 @@ impl Engine {
     }
 
     fn swap<O: OperationInternal>(incoming_sequence: &mut LinkedList<O>, existing_sequence: &mut LinkedList<DeleteOperation>)  {
+        trace!("Swapping {:?} and {:?}", incoming_sequence, existing_sequence);
+        {
+            let mut incoming_iter = incoming_sequence.iter_mut();
+            let mut existing_iter = existing_sequence.iter_mut();
+            let mut incoming_op = incoming_iter.next();
+            let mut existing_op = existing_iter.next();
+            let mut swapper = SequenceSwapper::new();
+            loop {
+
+                let advance_incoming = if let Some(ref mut existing_op) = existing_op {
+                     if let Some(ref mut incoming_op) = incoming_op {
+                         swapper.swap_operations::<O>(incoming_op, existing_op)
+                    } else {
+                        swapper.swap_existing(existing_op);
+                        false
+                    }
+                } else{
+                    if let Some(ref mut incoming_op) = incoming_op {
+                        swapper.swap_single::<O>(incoming_op);
+                        true
+                    }  else {
+                        break;
+                    }
+                };
+                if advance_incoming {
+                    incoming_op = incoming_iter.next();
+                } else {
+                    existing_op = existing_iter.next();
+                }
+
+            }
+        }
+        trace!("After swap: {:?} and {:?}", incoming_sequence, existing_sequence);
+    }
+
+
+
+    fn split_by(incoming_sequence: &mut LinkedList<DeleteOperation>, existing_sequence: &LinkedList<DeleteOperation>)  {
+        trace!("splitting {:?} by {:?}", incoming_sequence, existing_sequence);
         let mut incoming_iter = incoming_sequence.iter_mut();
-        let mut existing_iter = existing_sequence.iter_mut();
+        let mut existing_iter = existing_sequence.iter();
         let mut saved_op = None;
         let mut incoming_op = incoming_iter.next();
         let mut existing_op = existing_iter.next();
-        let mut swapper = SequenceSwapper::new();
-        println!("Loop Starting");
+        let mut splitter = SequenceSplitter::new();
         loop {
 
-            let advance_action = if let Some(ref mut existing_op) = existing_op {
+            let advance_action = if let Some(existing_op) = existing_op {
                  if let Some(ref mut incoming_op) = incoming_op {
-                     swapper.swap_operations::<O>(incoming_op, existing_op)
-                } else {
-                    if let Some(ref mut incoming_op) = saved_op{
-                        swapper.swap_operations::<O>(incoming_op, existing_op)
-                    } else {
-                        swapper.swap_existing(existing_op);
-                        Advance::Existing
-                    }
+                     splitter.split_operations(incoming_op, existing_op)
+                } else if let Some(ref mut incoming_op) = saved_op {
+                    splitter.split_operations(incoming_op, existing_op)
+               } else {
+                    break
                 }
             } else{
-                if let Some(ref mut incoming_op) = incoming_op {
-                    swapper.swap_single::<O>(incoming_op);
+                if let Some(_) = saved_op {
                     Advance::Incoming
-                } else if let Some(ref mut incoming_op) = saved_op{
-                    swapper.swap_single::<O>(incoming_op);
-                    Advance::Incoming
-                } else {
-                    break;
-                }
+               } else {
+                   break
+               }
             };
             match advance_action {
                 Advance::Incoming => {
@@ -315,9 +451,10 @@ impl Engine {
 
     fn merge_sequences<O: OperationInternal>(seq1: &mut LinkedList<O>, seq2: &LinkedList<O>) {
         fn something_less<O: OperationInternal>(mut a: Option<&mut O>, b: &O, offset: Offset) -> bool {
+            trace!("Comparing {:?} and {:?} with offset {}", a, b, offset);
             match a {
                 Some(ref mut a) => {
-                    if (**a).cmp(&b) == Ordering::Less {
+                    if a.get_position() as Offset <= b.get_position() as Offset - offset {
                         (**a).update_position_by(offset);
                         true
                     } else {
@@ -329,6 +466,7 @@ impl Engine {
                 }
             }
         }
+        trace!("Merging sequence {:?} into {:?}", seq2, seq1);
         let mut seq1_iter = seq1.iter_mut();
         let mut seq2_iter = seq2.iter();
         let mut offset = 0;
@@ -343,70 +481,321 @@ impl Engine {
             seq1_iter.next().unwrap().update_position_by(offset);
         }
     }
+}
 
+impl fmt::Debug for Engine {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        try!(writeln!(f, "Site: {}", self.site_id));
+        try!(writeln!(f, "Inserts: {:?}", self.inserts));
+        writeln!(f, "Deletes: {:?}", self.deletes)
+    }
+}
 
+impl TimeStamper {
+    /// Create a new `TimeStamper`, with no stamps yet assigned
+    pub fn new() -> TimeStamper {
+        TimeStamper {
+            time_mapping: HashMap::new(),
+            last_timestamp: None
+        }
+    }
+
+    /// Stamp a remote operation corrsponding to the given site_id and remtoe timestamp
+    /// with a local timestamp.  If this remote id has never been stamped before, then
+    /// assign it a new timestamp, sequentially after the previous one.  If it has, the
+    /// previously assigned timestamp is returned
+    pub fn stamp_remote(&mut self, site_id: u32, remote_timestamp: u32) -> u32 {
+        match self.time_mapping.entry((site_id, remote_timestamp)) {
+            Entry::Occupied(entry) => {
+                *entry.get()
+            }, Entry::Vacant(entry) => {
+                let time_stamp =  self.last_timestamp.map_or(0, |(local, _)| local + 1);
+                entry.insert(time_stamp);
+                self.last_timestamp = Some((time_stamp, (site_id, remote_timestamp)));
+                time_stamp
+            }
+        }
+    }
+
+    /// Stamp a local operation.  This will always create a new timestamp
+    pub fn stamp_local(&mut self, site_id: u32) -> u32 {
+        let time_stamp =  self.last_timestamp.map_or(0, |(local, _)| local + 1);
+        self.time_mapping.insert((site_id, time_stamp), time_stamp);
+        self.last_timestamp = Some((time_stamp, (site_id, time_stamp)));
+        time_stamp
+    }
+
+    /// Gets the local timestamp corresponding to a given remote site_id and remote timestamp
+    pub fn get_local_timestamp_for(&self, remote_site_id: u32, remote_timestamp: u32) -> Option<u32> {
+        self.time_mapping.get(&(remote_site_id, remote_timestamp)).map(|t| {*t})
+    }
+
+    /// Gets a mapping of timestamps since the given remote site_id and remote timesamp, ordered sequentially, or none if the remote timestamp isn't in the lookup
+    pub fn get_timestamps_since(&self, remote: Option<(u32, u32)>) -> Option<BTreeMap<u32, (u32, u32)>> {
+        if let Some((remote_site_id, remote_timestamp)) = remote {
+            self.get_local_timestamp_for(remote_site_id, remote_timestamp).map(|local_timestamp| {
+                self.time_mapping.iter().filter(|&(_, saved_timestamp)| {
+                    *saved_timestamp > local_timestamp
+                }).map(|(&(a, b), c)|{(*c, (a, b))}).collect()
+            })
+        } else {
+            Some(self.time_mapping.iter().map(|(&(a, b), c)|{(*c, (a, b))}).collect())
+        }
+    }
+
+    #[inline]
+    /// Gets the most recent timestamp this stamper has assigned, or None if it has not yet assigned a timestamp.
+    /// The timestamp contains both the local and remote timestamps
+    pub fn get_last_timestamp(&self) -> Option<(u32, (u32, u32))> {
+        self.last_timestamp
+    }
+
+    /// Compresses this `TimeStamper` to an output source.  This can then be
+    /// expanded again using `expand_from`
+    pub fn compress_to<W: io::Write>(&self, writer: &mut W) -> io::Result<()> {
+        let mut int_buf = [0;4];
+        NetworkEndian::write_u32(&mut int_buf, self.time_mapping.len() as u32);
+        try!(writer.write(&int_buf));
+        for (&(site_id, remote), local) in self.time_mapping.iter() {
+            NetworkEndian::write_u32(&mut int_buf, site_id);
+            try!(writer.write(&int_buf));
+            NetworkEndian::write_u32(&mut int_buf, remote);
+            try!(writer.write(&int_buf));
+            NetworkEndian::write_u32(&mut int_buf, *local);
+            try!(writer.write(&int_buf));
+        }
+        Ok(())
+    }
+
+    /// Expands a `TimeStamper` from an input source that was previous written to
+    /// by `compress_to()`
+    pub fn expand_from<R: io::Read>(reader: &mut R) -> io::Result<TimeStamper> {
+        let mut int_buf = [0;4];
+        try!(reader.read_exact(&mut int_buf));
+        let map_len = NetworkEndian::read_u32(&int_buf) as usize;
+        let mut time_mapping = HashMap::with_capacity(map_len);
+        let mut biggest = None;
+        for _ in 0..map_len {
+            try!(reader.read_exact(&mut int_buf));
+            let site_id = NetworkEndian::read_u32(&int_buf);
+            try!(reader.read_exact(&mut int_buf));
+            let remote = NetworkEndian::read_u32(&int_buf);
+            try!(reader.read_exact(&mut int_buf));
+            let local = NetworkEndian::read_u32(&int_buf);
+            let bigger = match biggest {
+                Some((biggest_local, _)) => {
+                     local > biggest_local
+                }, None => {
+                    true
+                }
+            };
+            if bigger {
+                biggest = Some((local, (site_id, remote)));
+            }
+            time_mapping.insert((site_id, remote), local);
+        }
+        Ok(TimeStamper {
+            time_mapping: time_mapping,
+            last_timestamp: biggest
+        })
+    }
 }
 
 impl TransactionSequence {
 
     /// Construct a new `TransactionSequence` from the given operations and metadata
-    /// The `starting_state` is the state of the file (as represented by a time_stamp) at the time the sequence was created, or `None` if the file was newly created.
-    /// The site is the location this `TransactionSequence` came from.
+    /// `last_timestamp` is the last stamp that was assigned before this operation was created
+    /// `timestamp_lookup` is a mapping between local timestamps and their remote counterparts
     #[inline]
-    pub fn new(starting_state: Option<State>, site: u32, inserts: LinkedList<InsertOperation>, deletes: LinkedList<DeleteOperation>) -> TransactionSequence {
+    pub fn new(last_timestamp: Option<(u32, u32)>, inserts: LinkedList<InsertOperation>, deletes: LinkedList<DeleteOperation>) -> TransactionSequence {
         TransactionSequence {
-            starting_state: starting_state,
+            last_timestamp: last_timestamp,
             inserts: inserts,
-            deletes: deletes,
-            original_site: site
+            deletes: deletes
         }
     }
 
+//Words words words. More words! Hey Words!words!s words
+//Got the stuff! And this other thing! Now how about this?
 
     /// Apply the operations in this sequence to a file.  This should not be called until after
     /// the sequence has been integrated via [`Engine::integrate_remote`](struct.Engine.html#method.integrate_remote)
-    pub fn apply<P: AsRef<Path> + Clone>(&self, path: P) -> io::Result<()> {
-        let read_file = try!(File::open(path.clone()));
-        let mut old_bytes = read_file.bytes();
-        let mut new_bytes = Vec::new();
-        let mut index = 0;
+    /// The file must have been opened on both read and write mode (see [OpenOptions](https://doc.rust-lang.org/nightly/std/fs/struct.OpenOptions.html)).
+    pub fn apply(&self, file: &mut File) -> io::Result<()> {
+        use std::slice;
+        try!(file.seek(SeekFrom::Start(0)));
+        // TODO try to find the size of the file?
+        // XXX In future, we want this to read in chunks of the file at a time.
+        let mut file_bytes = Vec::new();
+
+        try!(file.read_to_end(&mut file_bytes));
+        try!(file.seek(SeekFrom::Start(0)));
+        try!(file.set_len(0));
+        let mut insert_stack:VecDeque<slice::Iter<u8>> = VecDeque::new();
+        let mut current_delete = 0;
+        insert_stack.push_front(file_bytes.iter());
+        let mut inserts = self.inserts.iter().peekable();
+        let mut deletes = self.deletes.iter().peekable();
+        let mut insert_index = 0;
+        let mut delete_index = 0;
+        while !insert_stack.is_empty() {
+            let should_insert = if let Some(next_insert) = inserts.peek() {
+                if next_insert.get_position() == insert_index {
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if should_insert {
+                insert_stack.push_front(inserts.next().unwrap().get_value().iter());
+            } else {
+                let should_delete = if let Some(delete) = deletes.peek() {
+                    if delete.get_position() == delete_index {
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if should_delete {
+                    current_delete += deletes.next().unwrap().get_length();
+                } else {
+                    let next = insert_stack.front_mut().unwrap().next();
+                    if let Some(next) = next {
+                        if current_delete == 0 {
+                            try!(file.write(&[*next]));
+                            insert_index += 1;
+                            delete_index += 1;
+                        } else {
+                            current_delete -= 1;
+                            insert_index += 1;
+                        }
+                    } else {
+                        insert_stack.pop_front();
+                    }
+                }
+            }
+        }
+        Ok(())
+        // for insert in self.inserts.iter() {
+        //     while index < insert.get_position() {
+        //         new_bytes.push(try!(old_bytes.next().unwrap()).clone());
+        //         index += 1;
+        //     }
+        //     new_bytes.extend_from_slice(insert.get_value());
+        //     index += insert.get_value().len() as Position;
+        // }
+        // while let Some(byte) = old_bytes.next() {
+        //     new_bytes.push(try!(byte));
+        // }
+        // let old_bytes = mem::replace(&mut new_bytes, Vec::new());
+        // let mut old_bytes = old_bytes.into_iter();
+        // index = 0;
+        // for delete in self.deletes.iter() {
+        //     while index < delete.get_position() {
+        //         new_bytes.push(match old_bytes.next(){
+        //             Some(b) => b,
+        //             None => {
+        //                 panic!("Could not read byte {}", index);
+        //             }
+        //         });
+        //         index += 1;
+        //     }
+        //     for _ in 0..delete.get_length() {
+        //         old_bytes.next();
+        //     }
+        // }
+        // while let Some(byte) = old_bytes.next() {
+        //     new_bytes.push(byte);
+        // }
+        //
+        // try!(file.seek(SeekFrom::Start(0)));
+        // try!(file.set_len(new_bytes.len() as u64));
+        // file.write_all(new_bytes.as_slice())
+    }
+
+    /// Compress this transaction and write to `writer`.  The output can then be expanded
+    /// back into an equivilent Transaction using `expand_from()`
+    pub fn compress_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let mut int_buf = [0;4];
+        if let Some((site_id, timestamp)) = self.last_timestamp {
+            try!(writer.write(&[1]));
+            NetworkEndian::write_u32(&mut int_buf, site_id);
+            try!(writer.write(&mut int_buf));
+            NetworkEndian::write_u32(&mut int_buf, timestamp);
+            try!(writer.write(&mut int_buf));
+        } else {
+            try!(writer.write(&[0]));
+        }
+
+        NetworkEndian::write_u32(&mut int_buf, self.inserts.len() as u32);
+        try!(writer.write(&mut int_buf));
         for insert in self.inserts.iter() {
-            while index < insert.get_position() {
-                new_bytes.push(try!(old_bytes.next().unwrap()).clone());
-                index += 1;
-            }
-            new_bytes.extend_from_slice(insert.get_value());
-            index += insert.get_value().len() as Position;
+            try!(insert.compress_to(writer, false));
         }
-        while let Some(byte) = old_bytes.next() {
-            new_bytes.push(try!(byte));
-        }
-        let old_bytes = mem::replace(&mut new_bytes, Vec::new());
-        let mut old_bytes = old_bytes.into_iter();
-        index = 0;
+        NetworkEndian::write_u32(&mut int_buf, self.deletes.len() as u32);
+        try!(writer.write(&mut int_buf));
         for delete in self.deletes.iter() {
-            while index < delete.get_position() {
-                new_bytes.push(old_bytes.next().unwrap());
-                index += 1;
-            }
-            for _ in 0..delete.get_length() {
-                old_bytes.next();
-            }
+            try!(delete.compress_to(writer));
         }
-        while let Some(byte) = old_bytes.next() {
-            new_bytes.push(byte);
+        Ok(())
+    }
+
+    /// Expand this transaction from previously compressed data in `reader`.  The data in reader
+    /// should have been written using `compress_to()`
+    pub fn expand_from<R: Read>(reader: &mut R, timestamp_lookup: Option<&BTreeMap<u32, (u32, u32)>>) -> io::Result<TransactionSequence> {
+        trace!("Reading transaction");
+        let mut bool_buffer = [0;1];
+        let mut int_buf = [0;4];
+        try!(reader.read_exact(&mut bool_buffer));
+        let last_timestamp = if bool_buffer[0] == 1 {
+            trace!("Reading State");
+            try!(reader.read_exact(&mut int_buf));
+            let site_id = NetworkEndian::read_u32(&int_buf);
+            try!(reader.read_exact(&mut int_buf));
+            let time_stamp = NetworkEndian::read_u32(&int_buf);
+            Some((site_id, time_stamp))
+        } else {
+            trace!("No state");
+            None
+        };
+
+        let mut int_buf = [0;4];
+        trace!("Reading insert length");
+        try!(reader.read_exact(&mut int_buf));
+        let insert_len = NetworkEndian::read_u32(&int_buf);
+        trace!("Insert length was: {}", insert_len);
+        let mut inserts = LinkedList::new();
+        for _ in 0..insert_len {
+            inserts.push_back(try!(InsertOperation::expand_from(reader, timestamp_lookup)))
         }
-        let mut write_file = try!(File::create(path));
-        write_file.write_all(new_bytes.as_slice())
+        trace!("Read inserts");
+        trace!("Reading delete length");
+        try!(reader.read_exact(&mut int_buf));
+        let delete_len = NetworkEndian::read_u32(&int_buf);
+        trace!("Delete length was: {}", delete_len);
+        let mut deletes = LinkedList::new();
+        for _ in 0..delete_len {
+            deletes.push_back(try!(DeleteOperation::expand_from(reader)));
+        }
+        trace!("Read deletes");
+        Ok(TransactionSequence {
+            last_timestamp: last_timestamp,
+            inserts: inserts,
+            deletes: deletes
+        })
     }
 }
 
 
 #[cfg(test)]
 mod tests {
-    use super::{Engine, TransactionSequence};
-    use std::collections::LinkedList;
-    use operations::{InsertOperation, DeleteOperation, State, Operation};
+    use super::{Engine, TransactionSequence, TimeStamper};
+    use std::collections::{LinkedList, BTreeMap};
+    use operations::{InsertOperation, DeleteOperation, Operation};
     use ::{Position};
     extern crate env_logger;
 
@@ -418,24 +807,16 @@ mod tests {
         };
     }
 
-    fn generate_insert_list(operation_details: Vec<(Position, &'static str)>, site_id: u32) -> LinkedList<InsertOperation> {
-        let mut the_list = LinkedList::new();
-        let mut time_stamp = 0;
-        for (position, value) in operation_details {
-            the_list.push_back(InsertOperation::new(position, value.bytes().collect(), State::new(site_id, time_stamp, time_stamp)));
-            time_stamp += 1;
-        }
-        the_list
+    fn generate_insert_list(operation_details: Vec<(Position, &'static str)>, site_id: u32, starting_time: u32) -> LinkedList<InsertOperation> {
+        operation_details.iter().map(|&(position, value)| {
+            InsertOperation::new(position, value.bytes().collect(), starting_time, site_id)
+        }).collect()
     }
 
-    fn generate_delete_list(operation_details: Vec<(Position, Position)>, site_id: u32) -> LinkedList<DeleteOperation> {
-        let mut the_list = LinkedList::new();
-        let mut time_stamp = 0;
-        for (position, length) in operation_details {
-            the_list.push_back(DeleteOperation::new(position, length, State::new(site_id, time_stamp, time_stamp)));
-            time_stamp += 1;
-        }
-        the_list
+    fn generate_delete_list(operation_details: Vec<(Position, Position)>, site_id: u32, starting_time: u32) -> LinkedList<DeleteOperation> {
+        operation_details.iter().map(|&(position, length)| {
+            DeleteOperation::new(position, length, starting_time)
+        }).collect()
     }
 
     fn to_insert_tuple_vec<'a>(list: &'a LinkedList<InsertOperation>) -> Vec<(Position, &'a str)> {
@@ -464,7 +845,7 @@ mod tests {
             (18, "wnwnwn"),
             // Add "xx!" to the end of "fox"
             (28, "xx!")
-        ], 2);
+        ], 2, 0);
         // After sequence1 is applied, we would have "Theee quickk brownwnwnwn foxxx!"
         let sequence2 = generate_insert_list(vec![
             // insert "very " after "the"
@@ -473,7 +854,7 @@ mod tests {
             (14, "ly"),
             // insert "u" after the 'o' in "brown"
             (20, "u"),
-        ], 1);
+        ], 1, 4);
         Engine::transform(&mut sequence1, &sequence2);
         // After sequence2 is applied, we would have "The very quickly brouwn fox"
         assert_eq!(to_insert_tuple_vec(&sequence1), vec![
@@ -503,7 +884,7 @@ mod tests {
             (15, 2),
             // delete the "o" from "fox"
             (19, 1),
-        ], 1);
+        ], 1, 0);
         // after sequence1 is applied, we would have "Th vry qckly brwn fx"
         let sequence2 = generate_insert_list(vec![
             // Add an "ee" after "the"
@@ -514,7 +895,7 @@ mod tests {
             (26, "wnwnwn"),
             // Add "xx!" to the end of "fox"
             (36, "xx!"),
-        ], 2);
+        ], 2, 5);
         // After sequence2 is applied, we will have "Theee very quicklyk brouwnwnwnwn foxxx!"
         Engine::transform(&mut sequence1, &sequence2);
         assert_eq!(to_delete_tuple_vec(&sequence1), vec![
@@ -541,7 +922,7 @@ mod tests {
           (15, 7),
           // Delete "laz"
           (20, 3),
-      ], 2);
+      ], 2, 0);
       // After sequence1 is applied, we will have "The wn fox jump the y dog"
       let mut sequence2 =  generate_delete_list(vec![
           // Delete "he qu"
@@ -552,7 +933,7 @@ mod tests {
           (4, 4),
           // Delete "the lazy dog"
           (21, 12),
-      ], 1);
+      ], 1, 3);
       // After sequence2 is applied, we will have "Ti b fox jumped over "
       let mut seq1_prime = sequence1.clone();
       Engine::transform(&mut seq1_prime, &sequence2);
@@ -594,7 +975,7 @@ mod tests {
           (6, 3),
           // Delete "" after "n"
           (11, 0),
-      ], 2);
+      ], 2, 0);
       // After sequence1 is applied, we will have "Te quibrown fox jumped over the lazy dog"
       let mut sequence2 = generate_delete_list(vec![
           // Delete "e"
@@ -607,7 +988,7 @@ mod tests {
           (18, 2),
           // Detete " " after "the
           (29, 1),
-      ], 1);
+      ], 1, 4);
       // After sequence2 is applied, we will have "Th quik brn fox jued over thelazy dog"
       Engine::transform(&mut sequence2, &sequence1);
       assert_eq!(to_delete_tuple_vec(&sequence2), vec![
@@ -639,7 +1020,7 @@ mod tests {
           (18, 3),
           // Delete "dog"
           (24, 3),
-      ], 1);
+      ], 1, 0);
       // After these operations run, we will have " quick  fox  over  lazy "
       let mut sequence2 =  generate_delete_list(vec![
           // Delete "quick"
@@ -650,7 +1031,7 @@ mod tests {
           (19, 4),
           // Delete "lazy"
           (24, 4),
-      ], 2);
+      ], 2, 5);
       // After these operations, we will have "The  brown  jumped  the  dog"
       let mut seq1_prime = sequence1.clone();
       Engine::transform(&mut seq1_prime, &sequence2);
@@ -681,6 +1062,37 @@ mod tests {
   }
 
   #[test]
+  fn test_split() {
+      // starting with buffer "The quick brown fox jumped over the lazy dog"
+      let mut sequence1 = generate_delete_list(vec![
+          // Delete "The  brown"
+          (0, 10),
+          // Delete "jumped  the  dog"
+          (2, 16),
+      ], 1, 0);
+      // After these operations run, we will have " "
+      let mut sequence2 = generate_delete_list(vec![
+          // Delete "quick"
+          (4, 5),
+          // Delete "fox"
+          (11, 3),
+          // Delete "over"
+          (19, 4),
+          // Delete "lazy"
+          (24, 4),
+      ], 2, 2);
+      // After these operations, we will have "The  brown  jumped  the  dog"
+      Engine::split_by(&mut sequence1, &sequence2);
+      assert_eq!(to_delete_tuple_vec(&sequence1), vec![
+        (0, 4),
+        (0, 6),
+        (2, 7),
+        (2, 5),
+        (2, 4)
+      ]);
+  }
+
+  #[test]
   fn test_swap_delete_insert(){
       // Starting with the buffer "The quick brown fox"
         let mut sequence1 = generate_insert_list(vec![
@@ -690,7 +1102,7 @@ mod tests {
             (12, "ly"),
             // insert "u" before the 'w'  in "wn"
             (15, "u"),
-        ], 1);
+        ], 1, 0);
         // After this runs, we will have "T very quickly uwn ox"
         let mut sequence2 = generate_delete_list(vec![
             // Delete the "he" from "the"
@@ -699,7 +1111,7 @@ mod tests {
             (8, 3),
             // Delete "f" from "fox"
             (11, 1)
-        ], 2);
+        ], 2, 3);
       // After this runs, we will have  "T quick wn ox"
       Engine::swap(&mut sequence1, &mut sequence2);
       assert_eq!(to_insert_tuple_vec(&sequence1), vec![
@@ -736,7 +1148,7 @@ mod tests {
               (6, 3),
               // Delete "dog"
               (8, 3),
-          ], 1);
+          ], 1, 0);
           // After these operations run, we will have " quick  fox  over  lazy "
           let mut sequence2 = generate_delete_list(vec![
               // Delete "quick"
@@ -747,7 +1159,7 @@ mod tests {
               (19, 4),
               // Delete "lazy"
               (24, 4),
-          ], 2);
+          ], 2, 5);
           // After these operations, we will have "The  brown  jumped  the  dog"
 
           Engine::swap(&mut sequence1, &mut sequence2);
@@ -783,7 +1195,7 @@ mod tests {
               (0, 10),
               // Delete "jumped  the  dog"
               (2, 16),
-          ], 1);
+          ], 1, 0);
           // After these operations run, we will have " "
           let mut sequence2 = generate_delete_list(vec![
               // Delete "quick"
@@ -794,9 +1206,9 @@ mod tests {
               (19, 4),
               // Delete "lazy"
               (24, 4),
-          ], 2);
+          ], 2, 2);
           // After these operations, we will have "The  brown  jumped  the  dog"
-
+          Engine::split_by(&mut sequence1, &sequence2);
           Engine::swap(&mut sequence1, &mut sequence2);
           assert_eq!(to_delete_tuple_vec(&sequence1), vec![
               // Delete "The "
@@ -825,7 +1237,6 @@ mod tests {
 
       #[test]
       fn test_integrate_sequences(){
-          let _ = env_logger::init().unwrap();
           let mut engine = Engine::new(1);
           engine.inserts = generate_insert_list(vec![
               (0, "The quick brown fox"),
@@ -835,7 +1246,8 @@ mod tests {
               (14, "ly"),
               // insert "u" after the 'o' in "brown"
               (20, "u"),
-          ], 1);
+          ], 1, 1);
+          engine.inserts.front_mut().unwrap().set_timestamp(0);
           // After the inserts are applied, we would have "The very quickly brouwn fox"
 
           engine.deletes = generate_delete_list(vec![
@@ -849,11 +1261,15 @@ mod tests {
               (15, 2),
               // delete the "o" from "fox"
               (19, 1),
-          ], 1);
-
+          ], 1, 1);
+          let mut stamper = TimeStamper::new();
+          stamper.stamp_local(1);
+          stamper.stamp_local(1);
+          stamper.stamp_remote(2, 0);
           // After the deletes are applied, we would have "Th vry qckly brwn fx"
-
-          let mut sequence = TransactionSequence::new(Some(State::new(1, 0, 0)), 2, generate_insert_list(vec![
+          let mut lookup = BTreeMap::new();
+          lookup.insert(0, (2, 0));
+          let mut sequence = TransactionSequence::new(Some((1, 0)), generate_insert_list(vec![
               // Add an "ee" after "the"
               (3, "ee"),
               // Add another "k" on the end of "quick"
@@ -862,17 +1278,17 @@ mod tests {
               (18, "wnwnwn"),
               // Add "xx!" to the end of "fox"
               (28, "xx!"),
-          ], 2), generate_delete_list(vec![  // After the inserts, we would have "Theee quickk brownwnwnwn foxxx!"
+          ], 2, 0), generate_delete_list(vec![  // After the inserts, we would have "Theee quickk brownwnwnwn foxxx!"
               // Delete the "he" from "theee"
               (1, 2),
               // Delete "bro" from "brownwnwnwn"
               (11, 3),
               // Delete "f" from "foxxx"
               (20, 1)
-          ], 2));
+          ], 2, 0));
           // After the deletes, we would have "Tee quickk wnwnwnwn oxxx!"
 
-          engine.integrate_remote(&mut sequence).unwrap();
+          engine.integrate_remote(&mut sequence, &lookup, &mut stamper).unwrap();
 
           assert_eq!(to_insert_tuple_vec(&sequence.inserts), vec![
               // Add an "ee" after "th"
@@ -932,6 +1348,9 @@ mod tests {
               (24, 1),
           ]);
           // After all the deletes are applied, we should have "Tee vry qcklyk wnwnwnwn xxx!"
+
+          let insert_timestamps:Vec<_> = engine.inserts.iter().map(InsertOperation::get_timestamp).collect();
+          assert_eq!(insert_timestamps, vec![0, 2, 1, 1, 2, 1, 2, 2]);
       }
       #[test]
       fn test_process_transaction() {
@@ -944,7 +1363,8 @@ mod tests {
             (14, "ly"),
             // insert "u" after the 'o' in "brown"
             (20, "u"),
-        ], 1);
+        ], 1, 0);
+        engine.inserts.front_mut().unwrap().set_timestamp(0);
         // After the inserts are applied, we would have "The very quickly brouwn fox"
 
         engine.deletes = generate_delete_list(vec![
@@ -958,11 +1378,11 @@ mod tests {
             (15, 2),
             // delete the "o" from "fox"
             (19, 1),
-        ], 1);
+        ], 1, 4);
 
         // After the deletes are applied, we would have "Th vry qckly brwn fx"
 
-        let mut sequence = TransactionSequence::new(Some(State::new(1, 0, 0)), 2, generate_insert_list(vec![
+        let mut sequence = TransactionSequence::new(Some((1, 0)), generate_insert_list(vec![
             // Add an "ee" after "th"
             (2, "ee"),
             // Add another "k" on the end of "quickly"
@@ -972,14 +1392,14 @@ mod tests {
             // Add "xx!" to the end of "fox"
             (29, "xx!"),
             // After the inserts, we would have "Thee vry qcklyk brwnwnwnwn fxxx!"
-        ], 2), generate_delete_list(vec![
+        ], 2, 0), generate_delete_list(vec![
             // Delete the "h" from "thee"
             (1, 1),
             // Delete "br" from "brwnwnwnwn"
             (15, 2),
             // Delete "f" from "foxxx!"
             (24, 1)
-        ], 2));
+        ], 2, 4));
         // After the deletes, we would have "Tee vry qcklyk wnwnwnwn oxxx!"
 
         engine.process_transaction(&mut sequence);
@@ -1043,6 +1463,60 @@ mod tests {
             (24, 1),
         ]);
         // After all the deletes are applied, we should have "Tee vry qcklyk wnwnwnwn xxx!"
+    }
+
+    #[test]
+    fn full_process() {
+        let _ = env_logger::init().unwrap();
+        let mut engine = Engine::new(1);
+        engine.inserts = generate_insert_list(vec![
+            (0, "Some words"),
+            (8, "ds and these words!"),
+            (8, "ds and something in the middle and t")
+        ], 1, 0);
+        engine.deletes = generate_delete_list(vec![
+            (44, 8),
+            (55, 2)
+        ], 1, 0);
+        let mut stamper = TimeStamper::new();
+        stamper.stamp_local(1);
+        let mut engine2 = engine.clone();
+        engine2.site_id = 2;
+
+        let mut lookup = BTreeMap::new();
+        lookup.insert(0, (1, 0));
+        let mut transaction = TransactionSequence::new(Some((1, 0)), LinkedList::new(), generate_delete_list(vec![
+            (0, 55)
+        ], 1, 0));
+
+        engine.process_transaction(&mut transaction);
+
+        assert_eq!(to_delete_tuple_vec(&transaction.deletes), vec![
+            (0, 44),
+            (8, 11)
+        ]);
+
+        assert_eq!(to_delete_tuple_vec(&engine.deletes), vec![
+            (0, 44),
+            (0, 8),
+            (0, 11),
+            (0, 2),
+        ]);
+
+        engine2.integrate_remote(&mut transaction, &lookup, &mut stamper).unwrap();
+
+        assert_eq!(to_delete_tuple_vec(&transaction.deletes), vec![
+            (0, 44),
+            (0, 11)
+        ]);
+
+        assert_eq!(to_delete_tuple_vec(&engine2.deletes), vec![
+            (0, 44),
+            (0, 8),
+            (0, 11),
+            (0, 2),
+        ]);
+
     }
 
 }

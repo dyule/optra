@@ -6,6 +6,10 @@ pub struct SequenceSwapper {
     existing_offset: Offset,
 }
 
+pub struct SequenceSplitter {
+    incoming_offset: Offset,
+    existing_offset: Offset,
+}
 
 pub struct SequenceTransformer {
     incoming_offset: Offset,
@@ -92,28 +96,18 @@ impl SequenceSwapper {
         }
     }
 
-    pub fn swap_operations<O: OperationInternal>(&mut self, incoming_operation: &mut O, exisiting_operation: &mut DeleteOperation) -> Advance<O> {
+    pub fn swap_operations<O: OperationInternal>(&mut self, incoming_operation: &mut O, exisiting_operation: &mut DeleteOperation) -> bool {
         trace!("Before: Existing: {:?}, Offset: {:?}. Incoming: {:?}, Offset: {:?}", exisiting_operation, self.existing_offset, incoming_operation, self.incoming_offset);
-        let overlap_result = exisiting_operation.crossed_by(incoming_operation, self.existing_offset, self.incoming_offset + self.existing_offset);
-        trace!("Cross: {:?}", overlap_result);
-        let r = match overlap_result {
-            CrossResult::Precedes => {
-                self.incoming_offset += incoming_operation.get_increment();
-                incoming_operation.update_position_by(-self.existing_offset);
-                Advance::Incoming
-            },
-            CrossResult::Follows => {
-                self.existing_offset += exisiting_operation.get_increment();
-                exisiting_operation.update_position_by(self.incoming_offset);
-                Advance::Existing
-            },
-            CrossResult::Crosses(front_difference) => {
-                let new_op = incoming_operation.split(front_difference);
-                self.incoming_offset += incoming_operation.get_increment();
-                incoming_operation.update_position_by(-self.existing_offset);
-                Advance::Neither(new_op)
-            }
+        let r = if incoming_operation.get_position() as Offset - self.incoming_offset - self.existing_offset < exisiting_operation.get_position() as Offset - self.existing_offset {
+            self.incoming_offset += incoming_operation.get_increment();
+            incoming_operation.update_position_by(-self.existing_offset);
+            true
+        } else {
+            self.existing_offset += exisiting_operation.get_increment();
+            exisiting_operation.update_position_by(self.incoming_offset);
+            false
         };
+
         trace!("After: Existing: {:?}, Offset: {:?}. Incoming: {:?}, Offset: {:?}", exisiting_operation, self.existing_offset, incoming_operation, self.incoming_offset);
         r
     }
@@ -125,4 +119,45 @@ impl SequenceSwapper {
     pub fn swap_existing(&self, operation: &mut DeleteOperation) {
         operation.update_position_by(self.incoming_offset);
     }
+}
+
+impl SequenceSplitter {
+    #[inline]
+    pub fn new() -> SequenceSplitter {
+        SequenceSplitter {
+            incoming_offset: 0,
+            existing_offset: 0,
+        }
+    }
+
+    pub fn split_operations(&mut self, incoming_operation: &mut DeleteOperation, exisiting_operation: &DeleteOperation) -> Advance<DeleteOperation> {
+        trace!("Before: Existing: {:?}, Offset: {:?}. Incoming: {:?}, Offset: {:?}", exisiting_operation, self.existing_offset, incoming_operation, self.incoming_offset);
+        let overlap_result = exisiting_operation.crossed_by(incoming_operation, self.existing_offset, self.incoming_offset + self.existing_offset);
+        trace!("Cross: {:?}", overlap_result);
+        let r = match overlap_result {
+            CrossResult::Precedes => {
+                self.incoming_offset += incoming_operation.get_increment();
+                Advance::Incoming
+            },
+            CrossResult::Follows => {
+                self.existing_offset += exisiting_operation.get_increment();
+                Advance::Existing
+            },
+            CrossResult::Crosses(front_difference) => {
+                let new_op = incoming_operation.split(front_difference);
+                self.incoming_offset += incoming_operation.get_increment();
+                Advance::Neither(new_op)
+            }
+        };
+        trace!("After: Existing: {:?}, Offset: {:?}. Incoming: {:?}, Offset: {:?}", exisiting_operation, self.existing_offset, incoming_operation, self.incoming_offset);
+        r
+    }
+
+    // pub fn swap_single<O: OperationInternal>(&self, operation: &mut O) {
+    //     operation.update_position_by(-self.existing_offset);
+    // }
+    //
+    // pub fn swap_existing(&self, operation: &mut DeleteOperation) {
+    //     operation.update_position_by(self.incoming_offset);
+    // }
 }

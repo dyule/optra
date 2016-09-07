@@ -19,6 +19,15 @@ Optra is licensed using the MIT license (see [LICENSE](LICENSE))
  This crate generally works well with [`rdiff`](https://crates.io/crates/rdiff), but can work with
  any system that generates difference operations that are limited to insert and delete.
 
+ To use simply include
+
+ ```toml
+ [dependencies]
+ optra = "^0.1"
+ ```
+
+ in your `Cargo.toml` file
+
  Examples
 
  Assuming you have a method `read_transaction` for reading transactions from remote sites,

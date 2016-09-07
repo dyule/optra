@@ -1,6 +1,6 @@
 [package]
 name = "optra"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Daniel Yule <daniel.yule@gmail.com>"]
 description = "An engine for remote file synchronization"
 documentation = "https://dyule.github.io/optra/optra/"
@@ -11,11 +11,9 @@ keywords = ["ABST", "OT", "file-synchronization", "synchronization", "remote-fil
 license = "MIT"
 
 [dependencies]
-serde = "^0.8"
-serde_json = "^0.8"
-serde_macros = "^0.8"
 log = "0.3"
-rdiff = "^0.1.1"
+rdiff = {version = "^0.1", path = "../rdiff"}
+byteorder = "0.5"
 
 [dev-dependencies]
 env_logger = "0.3"
