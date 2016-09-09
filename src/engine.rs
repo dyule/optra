@@ -40,6 +40,9 @@ pub struct TimeStamper {
     /// A mapping between the remote id of a transaction and its local timstamp
     time_mapping: HashMap<(u32, u32), u32>,
 
+    /// A mapping between a loocal timestamp and its remote id
+    stamp_mapping: HashMap<u32, (u32, u32)>,
+
     /// The most recently used timestamp
     last_timestamp: Option<(u32, (u32, u32))>
 
@@ -211,17 +214,6 @@ impl Engine {
     /// should have been written using `compress_to()`
     pub fn expand_from<R: Read>(reader: &mut R, site_id: u32) -> io::Result<Engine> {
         trace!("Expanding engine");
-        // let mut bool_buffer = [0;1];
-        // trace!("Reading state");
-        // try!(reader.read_exact(&mut bool_buffer));
-        // let (state, time_stamp) = if bool_buffer[0] == 1 {
-        //     let state = try!(State::expand_from(reader));
-        //     let time_stamp = state.get_time() + 1;
-        //     (Some(state), time_stamp)
-        // } else {
-        //     (None, 0)
-        // };
-        // trace!("State read: {:?}", state);
         let mut int_buf = [0;4];
         trace!("Reading insert length");
         try!(reader.read_exact(&mut int_buf));
@@ -496,6 +488,7 @@ impl TimeStamper {
     pub fn new() -> TimeStamper {
         TimeStamper {
             time_mapping: HashMap::new(),
+            stamp_mapping: HashMap::new(),
             last_timestamp: None
         }
     }
@@ -505,22 +498,25 @@ impl TimeStamper {
     /// assign it a new timestamp, sequentially after the previous one.  If it has, the
     /// previously assigned timestamp is returned
     pub fn stamp_remote(&mut self, site_id: u32, remote_timestamp: u32) -> u32 {
-        match self.time_mapping.entry((site_id, remote_timestamp)) {
+        let new_stamp = match self.time_mapping.entry((site_id, remote_timestamp)) {
             Entry::Occupied(entry) => {
-                *entry.get()
+                return *entry.get()
             }, Entry::Vacant(entry) => {
                 let time_stamp =  self.last_timestamp.map_or(0, |(local, _)| local + 1);
                 entry.insert(time_stamp);
                 self.last_timestamp = Some((time_stamp, (site_id, remote_timestamp)));
                 time_stamp
             }
-        }
+        };
+        self.stamp_mapping.insert(new_stamp, (site_id, remote_timestamp));
+        new_stamp
     }
 
     /// Stamp a local operation.  This will always create a new timestamp
     pub fn stamp_local(&mut self, site_id: u32) -> u32 {
         let time_stamp =  self.last_timestamp.map_or(0, |(local, _)| local + 1);
         self.time_mapping.insert((site_id, time_stamp), time_stamp);
+        self.stamp_mapping.insert(time_stamp, (site_id, time_stamp));
         self.last_timestamp = Some((time_stamp, (site_id, time_stamp)));
         time_stamp
     }
@@ -541,6 +537,20 @@ impl TimeStamper {
         } else {
             Some(self.time_mapping.iter().map(|(&(a, b), c)|{(*c, (a, b))}).collect())
         }
+    }
+
+    /// Gets all of the timestamps that will be needed to lookup the operations in the transaction
+    pub fn get_timestamps_for(&self, transaction: &TransactionSequence) -> BTreeMap<u32, (u32, u32)> {
+        let mut map = BTreeMap::new();
+        for insert in transaction.inserts.iter() {
+            let timestamp = insert.get_timestamp();
+            map.insert(timestamp, *self.stamp_mapping.get(&timestamp).unwrap());
+        }
+        for delete in transaction.deletes.iter() {
+            let timestamp = delete.get_timestamp();
+            map.insert(timestamp, *self.stamp_mapping.get(&timestamp).unwrap());
+        }
+        map
     }
 
     #[inline]
@@ -574,6 +584,7 @@ impl TimeStamper {
         try!(reader.read_exact(&mut int_buf));
         let map_len = NetworkEndian::read_u32(&int_buf) as usize;
         let mut time_mapping = HashMap::with_capacity(map_len);
+        let mut stamp_mapping = HashMap::with_capacity(map_len);
         let mut biggest = None;
         for _ in 0..map_len {
             try!(reader.read_exact(&mut int_buf));
@@ -593,9 +604,11 @@ impl TimeStamper {
                 biggest = Some((local, (site_id, remote)));
             }
             time_mapping.insert((site_id, remote), local);
+            stamp_mapping.insert(local, (site_id, remote));
         }
         Ok(TimeStamper {
             time_mapping: time_mapping,
+            stamp_mapping: stamp_mapping,
             last_timestamp: biggest
         })
     }
@@ -680,41 +693,6 @@ impl TransactionSequence {
             }
         }
         Ok(())
-        // for insert in self.inserts.iter() {
-        //     while index < insert.get_position() {
-        //         new_bytes.push(try!(old_bytes.next().unwrap()).clone());
-        //         index += 1;
-        //     }
-        //     new_bytes.extend_from_slice(insert.get_value());
-        //     index += insert.get_value().len() as Position;
-        // }
-        // while let Some(byte) = old_bytes.next() {
-        //     new_bytes.push(try!(byte));
-        // }
-        // let old_bytes = mem::replace(&mut new_bytes, Vec::new());
-        // let mut old_bytes = old_bytes.into_iter();
-        // index = 0;
-        // for delete in self.deletes.iter() {
-        //     while index < delete.get_position() {
-        //         new_bytes.push(match old_bytes.next(){
-        //             Some(b) => b,
-        //             None => {
-        //                 panic!("Could not read byte {}", index);
-        //             }
-        //         });
-        //         index += 1;
-        //     }
-        //     for _ in 0..delete.get_length() {
-        //         old_bytes.next();
-        //     }
-        // }
-        // while let Some(byte) = old_bytes.next() {
-        //     new_bytes.push(byte);
-        // }
-        //
-        // try!(file.seek(SeekFrom::Start(0)));
-        // try!(file.set_len(new_bytes.len() as u64));
-        // file.write_all(new_bytes.as_slice())
     }
 
     /// Compress this transaction and write to `writer`.  The output can then be expanded
@@ -813,7 +791,7 @@ mod tests {
         }).collect()
     }
 
-    fn generate_delete_list(operation_details: Vec<(Position, Position)>, site_id: u32, starting_time: u32) -> LinkedList<DeleteOperation> {
+    fn generate_delete_list(operation_details: Vec<(Position, Position)>, starting_time: u32) -> LinkedList<DeleteOperation> {
         operation_details.iter().map(|&(position, length)| {
             DeleteOperation::new(position, length, starting_time)
         }).collect()
@@ -884,7 +862,7 @@ mod tests {
             (15, 2),
             // delete the "o" from "fox"
             (19, 1),
-        ], 1, 0);
+        ], 0);
         // after sequence1 is applied, we would have "Th vry qckly brwn fx"
         let sequence2 = generate_insert_list(vec![
             // Add an "ee" after "the"
@@ -922,7 +900,7 @@ mod tests {
           (15, 7),
           // Delete "laz"
           (20, 3),
-      ], 2, 0);
+      ], 0);
       // After sequence1 is applied, we will have "The wn fox jump the y dog"
       let mut sequence2 =  generate_delete_list(vec![
           // Delete "he qu"
@@ -933,7 +911,7 @@ mod tests {
           (4, 4),
           // Delete "the lazy dog"
           (21, 12),
-      ], 1, 3);
+      ], 3);
       // After sequence2 is applied, we will have "Ti b fox jumped over "
       let mut seq1_prime = sequence1.clone();
       Engine::transform(&mut seq1_prime, &sequence2);
@@ -975,7 +953,7 @@ mod tests {
           (6, 3),
           // Delete "" after "n"
           (11, 0),
-      ], 2, 0);
+      ], 0);
       // After sequence1 is applied, we will have "Te quibrown fox jumped over the lazy dog"
       let mut sequence2 = generate_delete_list(vec![
           // Delete "e"
@@ -988,7 +966,7 @@ mod tests {
           (18, 2),
           // Detete " " after "the
           (29, 1),
-      ], 1, 4);
+      ], 4);
       // After sequence2 is applied, we will have "Th quik brn fox jued over thelazy dog"
       Engine::transform(&mut sequence2, &sequence1);
       assert_eq!(to_delete_tuple_vec(&sequence2), vec![
@@ -1020,7 +998,7 @@ mod tests {
           (18, 3),
           // Delete "dog"
           (24, 3),
-      ], 1, 0);
+      ], 0);
       // After these operations run, we will have " quick  fox  over  lazy "
       let mut sequence2 =  generate_delete_list(vec![
           // Delete "quick"
@@ -1031,7 +1009,7 @@ mod tests {
           (19, 4),
           // Delete "lazy"
           (24, 4),
-      ], 2, 5);
+      ], 5);
       // After these operations, we will have "The  brown  jumped  the  dog"
       let mut seq1_prime = sequence1.clone();
       Engine::transform(&mut seq1_prime, &sequence2);
@@ -1069,9 +1047,9 @@ mod tests {
           (0, 10),
           // Delete "jumped  the  dog"
           (2, 16),
-      ], 1, 0);
+      ], 0);
       // After these operations run, we will have " "
-      let mut sequence2 = generate_delete_list(vec![
+      let sequence2 = generate_delete_list(vec![
           // Delete "quick"
           (4, 5),
           // Delete "fox"
@@ -1080,7 +1058,7 @@ mod tests {
           (19, 4),
           // Delete "lazy"
           (24, 4),
-      ], 2, 2);
+      ], 2);
       // After these operations, we will have "The  brown  jumped  the  dog"
       Engine::split_by(&mut sequence1, &sequence2);
       assert_eq!(to_delete_tuple_vec(&sequence1), vec![
@@ -1111,7 +1089,7 @@ mod tests {
             (8, 3),
             // Delete "f" from "fox"
             (11, 1)
-        ], 2, 3);
+        ], 3);
       // After this runs, we will have  "T quick wn ox"
       Engine::swap(&mut sequence1, &mut sequence2);
       assert_eq!(to_insert_tuple_vec(&sequence1), vec![
@@ -1148,7 +1126,7 @@ mod tests {
               (6, 3),
               // Delete "dog"
               (8, 3),
-          ], 1, 0);
+          ], 0);
           // After these operations run, we will have " quick  fox  over  lazy "
           let mut sequence2 = generate_delete_list(vec![
               // Delete "quick"
@@ -1159,7 +1137,7 @@ mod tests {
               (19, 4),
               // Delete "lazy"
               (24, 4),
-          ], 2, 5);
+          ], 5);
           // After these operations, we will have "The  brown  jumped  the  dog"
 
           Engine::swap(&mut sequence1, &mut sequence2);
@@ -1195,7 +1173,7 @@ mod tests {
               (0, 10),
               // Delete "jumped  the  dog"
               (2, 16),
-          ], 1, 0);
+          ], 0);
           // After these operations run, we will have " "
           let mut sequence2 = generate_delete_list(vec![
               // Delete "quick"
@@ -1206,7 +1184,7 @@ mod tests {
               (19, 4),
               // Delete "lazy"
               (24, 4),
-          ], 2, 2);
+          ], 2);
           // After these operations, we will have "The  brown  jumped  the  dog"
           Engine::split_by(&mut sequence1, &sequence2);
           Engine::swap(&mut sequence1, &mut sequence2);
@@ -1261,7 +1239,7 @@ mod tests {
               (15, 2),
               // delete the "o" from "fox"
               (19, 1),
-          ], 1, 1);
+          ], 1);
           let mut stamper = TimeStamper::new();
           stamper.stamp_local(1);
           stamper.stamp_local(1);
@@ -1285,7 +1263,7 @@ mod tests {
               (11, 3),
               // Delete "f" from "foxxx"
               (20, 1)
-          ], 2, 0));
+          ], 0));
           // After the deletes, we would have "Tee quickk wnwnwnwn oxxx!"
 
           engine.integrate_remote(&mut sequence, &lookup, &mut stamper).unwrap();
@@ -1378,7 +1356,7 @@ mod tests {
             (15, 2),
             // delete the "o" from "fox"
             (19, 1),
-        ], 1, 4);
+        ], 4);
 
         // After the deletes are applied, we would have "Th vry qckly brwn fx"
 
@@ -1399,7 +1377,7 @@ mod tests {
             (15, 2),
             // Delete "f" from "foxxx!"
             (24, 1)
-        ], 2, 4));
+        ], 4));
         // After the deletes, we would have "Tee vry qcklyk wnwnwnwn oxxx!"
 
         engine.process_transaction(&mut sequence);
@@ -1477,7 +1455,7 @@ mod tests {
         engine.deletes = generate_delete_list(vec![
             (44, 8),
             (55, 2)
-        ], 1, 0);
+        ], 0);
         let mut stamper = TimeStamper::new();
         stamper.stamp_local(1);
         let mut engine2 = engine.clone();
@@ -1487,7 +1465,7 @@ mod tests {
         lookup.insert(0, (1, 0));
         let mut transaction = TransactionSequence::new(Some((1, 0)), LinkedList::new(), generate_delete_list(vec![
             (0, 55)
-        ], 1, 0));
+        ], 0));
 
         engine.process_transaction(&mut transaction);
 

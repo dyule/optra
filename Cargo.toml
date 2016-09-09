@@ -1,6 +1,6 @@
 [package]
 name = "optra"
-version = "0.1.1"
+version = "0.2.1"
 authors = ["Daniel Yule <daniel.yule@gmail.com>"]
 description = "An engine for remote file synchronization"
 documentation = "https://dyule.github.io/optra/optra/"
@@ -12,7 +12,7 @@ license = "MIT"
 
 [dependencies]
 log = "0.3"
-rdiff = {version = "^0.1", path = "../rdiff"}
+rdiff = "0.1"
 byteorder = "0.5"
 
 [dev-dependencies]
