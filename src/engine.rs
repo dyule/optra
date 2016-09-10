@@ -156,11 +156,13 @@ impl Engine {
     /// operations in the transaction must also be effect order, with the inserts preceding the deletes.
     pub fn process_transaction(&mut self, outgoing_sequence: &mut TransactionSequence) {
 
-        Engine::split_by(&mut outgoing_sequence.deletes, &self.deletes);
 
         // Swap the execution order of the outgoing insert operations so that they happen before the local deletes
         Engine::swap(&mut outgoing_sequence.inserts, &mut self.deletes);
 
+        // Split the outgoing sequence by the existing deletes so that there is no overlap during the swap phase.
+        Engine::split_by(&mut outgoing_sequence.deletes, &self.deletes);
+        
         let original_deletes = outgoing_sequence.deletes.clone();
         // Swap the execution order of the outgoing delete operations so they happen before the local deletes
         Engine::swap(&mut outgoing_sequence.deletes, &mut self.deletes.clone());
